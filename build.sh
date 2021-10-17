@@ -32,7 +32,7 @@ fi
 
 # LIB_PATH=/usr/local/lib
 
-echo "building p2p-server"
-gcc p2p-server.c -Wl,-rpath $EXT_PATH/lib -o p2p-server -lenet
+echo "building server"
+gcc p2p-server.c -Wl,-rpath $EXT_PATH/lib -o server -lenet
 
 echo "done"
