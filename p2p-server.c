@@ -19,68 +19,82 @@
 #define u32_from_ptr(p) (unsigned long)((char *)p - (char *)0)
 
 #define IPSTR_LEN (16 + 1 + 5)
-#define CLIENT_MAX 16
+#define MAX_CLIENTS 32
 
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
 
-enum client_state
+typedef enum p2p_enum
 {
-  UNINITIALISED = 0,
-  LOOKING_FOR_PEER,
-  FOUND_PEER
-};
+    /* client state */
+    UNINITIALISED = 1000,
+    REGISTERED,
+    LOOKING_FOR_PEER,
+    FOUND_PEER,
+
+    /* join mode */
+    PASSIVE = 2000,
+    ACTIVE,
+
+    /* packet type */
+    P2P_PACKET_TYPE_INVALID = 7000,
+    P2P_PACKET_TYPE_REGISTRATION,
+    P2P_PACKET_TYPE_REGISTRATION_ACK,
+    P2P_PACKET_TYPE_MAX
+} p2p_enum;
 
 struct client
 {
   u32 id;
-  enum client_state state;
+  p2p_enum state;
   char name[32];
 
   ENetPeer *peer;
   ENetAddress priv;
   ENetAddress pub;
-};
 
-enum join_mode
-{
-  PASSIVE = 0,
-  ACTIVE
+  bool is_server;
+  u32 current_players;
+  u32 max_players;
 };
 
 struct join_packet
 {
   u32 id;
 
-  enum join_mode mode;
+  p2p_enum mode;
 
   ENetAddress priv;
   ENetAddress pub;
 };
 
+struct p2p_header
+{
+    u8 magic;           // 1
+#define P2P_MAGIC 117
+    p2p_enum type;      // 4
+    size_t len;         // 8
+};
+struct p2p_registration_packet
+{
+    bool is_server;     // 4
+    ENetAddress private;
+    char name[32];
+};
+
+struct p2p_registration_ack
+{
+    char msg[256];
+};
+
 static volatile sig_atomic_t g__running = false;
-static volatile sig_atomic_t g__dump_state = false;
-static struct client clients[CLIENT_MAX] = {};
+static volatile sig_atomic_t g__dump_client_state = false;
+static volatile sig_atomic_t g__dump_enet_peer_state = false;
+
+static struct client clients[MAX_CLIENTS] = {};
 static u32 client_count = 0;
-
-/*
-TODO: show server state
-
- *ctl app that sends a SIGUSR1 to the NAT server.
- The NAT server receives the signal and toggles a flag.
- Each loop iteration, the flag is checked, and if it has been
- toggled then we dump state to STDOUT!.. and then toggle the
- flag off again.
-
-TODO: client corraling
-
-First user to join becomes the server.
-Clients joining are told to join the server until it
-becomes full, then the first IDLE client is chosen to be a server
-and so on.
-*/
 
 static void
 __debug (const char *func, int line, char *fmt, ...)
@@ -102,10 +116,32 @@ client_state_str (struct client *c)
     {
     case UNINITIALISED:
       return "Uninitialised";
+    case REGISTERED:
+      return "Registered";
     case LOOKING_FOR_PEER:
       return "Looking for Peer";
     case FOUND_PEER:
       return "Found Peer";
+    default:
+      return "Unknown client state";
+    }
+}
+
+static char *
+enet_state_str (ENetPeerState state)
+{
+    switch (state)
+    {
+        case ENET_PEER_STATE_DISCONNECTED: return "ENetPeer_Disconnected";
+        case ENET_PEER_STATE_CONNECTING: return "ENetPeer_Connecting";
+        case ENET_PEER_STATE_ACKNOWLEDGING_CONNECT: return "ENetPeer_AcknowledgingConnect";
+        case ENET_PEER_STATE_CONNECTION_PENDING: return "ENetPeer_ConnectionPending";
+        case ENET_PEER_STATE_CONNECTION_SUCCEEDED: return "ENetPeer_Succeeded";
+        case ENET_PEER_STATE_CONNECTED: return "ENetPeer_Connected";
+        case ENET_PEER_STATE_DISCONNECT_LATER: return "ENetPeer_DisconnectLater";
+        case ENET_PEER_STATE_DISCONNECTING: return "ENetPeer_Disconnecting";
+        case ENET_PEER_STATE_ACKNOWLEDGING_DISCONNECT: return "ENetPeer_AcknowledgingDisconnected";
+        case ENET_PEER_STATE_ZOMBIE: return "ENetPeer_Zombie";
     }
 }
 
@@ -147,12 +183,11 @@ generate_id (ENetPeer *peer)
 {
   char addr[IPSTR_LEN];
 
-  enet_addr_to_str (&peer->address, addr, sizeof (addr));
-  return hash_string (addr, 0);
+  return hash_string (enet_addr_to_str (&peer->address, addr, sizeof (addr)), 0);
 }
 
 static ENetHost *
-setup (int port)
+setup (int port, int num_clients)
 {
   ENetHost *server;
   ENetAddress address;
@@ -160,12 +195,13 @@ setup (int port)
   address.host = ENET_HOST_ANY;
   address.port = port;
   server = enet_host_create (
-      &address,   /* the address to bind the server host to */
-      CLIENT_MAX, /* allow up to 32 clients and/or outgoing connections */
+      &address,
+      num_clients,
       2,          /* allow up to 2 channels to be used, 0 and 1 */
       0,          /* assume any amount of incoming bandwidth */
       0);         /* assume any amount of outgoing bandwidth */
   assert (server);
+
   return server;
 }
 
@@ -174,7 +210,7 @@ get_free_client_slot (void)
 {
   struct client *new = NULL;
 
-  if (client_count + 1 < CLIENT_MAX)
+  if (client_count + 1 < MAX_CLIENTS)
     {
       new = &clients[client_count++];
     }
@@ -184,6 +220,21 @@ get_free_client_slot (void)
     }
 
   return new;
+}
+
+static void
+remove_client (struct client *cln)
+{
+  cln->id = 0;
+  cln->state = UNINITIALISED;
+  cln->name[0] = '\0';
+  cln->peer = 0;
+  cln->priv.host = 0;;
+  cln->priv.port = 0;;
+  cln->pub.host = 0;;
+  cln->pub.port= 0;;
+
+  client_count--;
 }
 
 static struct client *
@@ -230,16 +281,16 @@ get_enet_peer_by_id (ENetHost *host, u32 id)
 static void
 dump_enet_peers (ENetHost *host)
 {
-  ENetPeer *peer;
+  ENetPeer *peer = NULL;
 
-  log ("ENet Peers:\n");
-  log ("-----------\n");
-  log ("peers:%p, peerCount:%d, connectedPeers:%d\n", host->peers,
+  debug ("ENet Peers:\n");
+  debug ("-----------\n");
+  debug ("peers:%p, peerCount:%d, connectedPeers:%d\n", host->peers,
        host->peerCount, host->connectedPeers);
 
   for (peer = host->peers; peer < &host->peers[host->peerCount]; ++peer)
     {
-      log ("  peer:%p id:%d state:%d\n", peer, peer->incomingPeerID,
+      debug ("  peer:%p id:%d state:%d\n", peer, peer->incomingPeerID,
            peer->state);
     }
 }
@@ -253,7 +304,10 @@ signal_handler (int signal)
       g__running = false;
       break;
     case SIGUSR1:
-      g__dump_state = true;
+      g__dump_client_state = true;
+      break;
+    case SIGUSR2:
+      g__dump_enet_peer_state = true;
       break;
     }
 }
@@ -269,7 +323,7 @@ match_clients (float dt)
       u32 lfp[32] = {};
       u32 num_lfp = 0;
 
-      if (g__dump_state)
+      if (g__dump_client_state)
         debug ("clients: %u\n", client_count);
 
       for (u32 i = 0; i < client_count; i++)
@@ -282,12 +336,10 @@ match_clients (float dt)
           enet_addr_to_str (&c->pub, pu, sizeof (pu));
           enet_addr_to_str (&c->priv, pr, sizeof (pr));
 
-          if (g__dump_state)
+          if (g__dump_client_state)
             {
-              debug ("id      : %u\n", c->id);
-              debug ("  pub   : %s\n", pu);
-              debug ("  priv  : %s\n", pr);
-              debug ("  state : %s\n", client_state_str (c));
+              debug ("[%u] id=%u name=%s pub=%s priv=%s state=%s\n",
+                      i, c->id, c->name, pu, pr, client_state_str (c));
             }
 
           if (c->state == LOOKING_FOR_PEER)
@@ -296,8 +348,8 @@ match_clients (float dt)
             }
         }
 
-      if (g__dump_state)
-        g__dump_state = false;
+      if (g__dump_client_state)
+        g__dump_client_state = false;
 
       if (num_lfp >= 2)
         {
@@ -355,57 +407,261 @@ match_clients (float dt)
   t += dt;
 }
 
+static void
+match_clients_v2 (float dt)
+{
+    static float t = 0;
+
+    if (g__dump_client_state)
+    {
+        debug ("DEBUG clients:\n");
+        debug ("--------------\n");
+        for (u32 i = 0; i < client_count; i++)
+        {
+            struct client *c = &clients[i];
+
+            char pu[32];
+            char pr[32];
+
+            enet_addr_to_str (&c->pub, pu, sizeof (pu));
+            enet_addr_to_str (&c->priv, pr, sizeof (pr));
+
+            debug ("[%u] id=%u name=%s pub=%s priv=%s state=%s is_server=%d players=%u/%u\n",
+                      i, c->id, c->name, pu, pr, client_state_str (c), c->is_server, c->current_players, c->max_players);
+
+        }
+
+        g__dump_client_state = false;
+    }
+
+    if (t >= 500.0f)
+    {
+        t = 0.0f;
+
+        if (client_count > 0)
+        {
+            // see if we can find a server with free slots
+            struct client *s = NULL;
+            for (u32 i = 0; i < client_count; i++)
+            {
+                struct client *c = &clients[i];
+
+                if (c->is_server &&
+                    c->state == REGISTERED &&
+                    c->current_players < c->max_players)
+                {
+                    s = c;
+                    break;
+                }
+                else
+                {
+                    s = NULL;
+                }
+            }
+
+            if (s)
+            {
+                // if we found a server, tell all of the connected clients to
+                // attempt to connect to it
+                for (u32 i = 0; i < client_count; i++)
+                {
+                    struct client *c = &clients[i];
+
+                    if (!c->is_server && c->state == REGISTERED)
+                    {
+                        debug ("matching server(%u) and client(%u)\n", s->id, c->id);
+                        ENetPeer *peer_c = c->peer;
+                        ENetPeer *peer_s = s->peer;
+                        assert (peer_c);
+                        assert (peer_s);
+
+                        char pu[32];
+                        char pr[32];
+
+                        enet_addr_to_str (&c->pub, pu, sizeof (pu));
+                        enet_addr_to_str (&c->priv, pr, sizeof (pr));
+
+                        // send server details to client
+                        struct join_packet p = {};
+                        p.id = s->id;
+                        p.mode = ACTIVE;
+                        p.priv.host = s->priv.host;
+                        p.priv.port = s->priv.port;
+                        p.pub.host = s->pub.host;
+                        p.pub.port = s->pub.port;
+                        ENetPacket *to_c
+                            = enet_packet_create ((void *)&p, sizeof (struct join_packet),
+                                    ENET_PACKET_FLAG_RELIABLE);
+                        enet_peer_send (peer_c, 0, to_c);
+
+                        debug ("sending server\'s(%u) details to client(%u)\n", s->id, c->id);
+
+                        // send client's details to server
+                        p.id = c->id;
+                        p.mode = PASSIVE;
+                        p.priv.host = c->priv.host;
+                        p.priv.port = c->priv.port;
+                        p.pub.host = c->pub.host;
+                        p.pub.port = c->pub.port;
+                        ENetPacket *to_s = enet_packet_create ((void *) &p, sizeof (struct join_packet),
+                                ENET_PACKET_FLAG_RELIABLE);
+                        enet_peer_send (peer_s, 0, to_s);
+
+                        debug ("sending client\'s(%u) details to server(%u)\n", c->id, s->id);
+
+                        s->current_players++;
+                        c->state = FOUND_PEER;
+                    }
+                }
+            }
+        }
+    }
+
+    t += dt;
+}
+
 static u32
 get_peer_id (ENetPeer *peer)
 {
-  u32 id = 0;
-
-  if (peer->data)
+    if (!peer->data)
     {
-      id = u32_from_ptr (peer->data);
-    }
-  else
-    {
-      id = generate_id (peer);
-      peer->data = ptr_from_u32 (id);
+        peer->data = ptr_from_u32 (generate_id (peer));
     }
 
-  return id;
+    return u32_from_ptr (peer->data);
+}
+
+static bool 
+parse_input (int argc, char *argv[], int *port)
+{
+    bool ret = false;
+
+    if (argc == 2)
+    {
+        *port = atoi (argv[1]);
+        ret = true;
+    }
+    else
+    {
+        log ("Usage: server <port>\n");
+    }
+
+    return ret;
+}
+
+static bool
+sig_init (void)
+{
+    return (signal (SIGINT, signal_handler) != SIG_ERR &&
+            signal (SIGUSR1, signal_handler) != SIG_ERR &&
+            signal (SIGUSR2, signal_handler) != SIG_ERR);
 }
 
 static void
-usage (void)
+packet_hexdump (u8 *data, size_t len)
 {
-  log ("Usage: server <port>\n");
+    int cols = 0;
+
+    printf ("packet hexdump (%d bytes)\n", len);
+    for (u32 i = 0; i < len; i++)
+    {
+        printf ("  %02x ", data[i]);
+        if (++cols == 4)
+        {
+            printf ("\n");
+            cols = 0;
+        }
+    }
+    printf ("\n");
+}
+
+static void
+process_packet (u32 id, u8 *data, size_t len)
+{
+    assert (len >= sizeof (struct p2p_header));
+
+    struct p2p_header *hdr = (struct p2p_header *) data;
+
+    assert (hdr->magic == P2P_MAGIC);
+    assert (hdr->type > P2P_PACKET_TYPE_INVALID);
+    assert (hdr->type < P2P_PACKET_TYPE_MAX);
+    assert (hdr->len > 0);
+
+    u8 *payload = data + sizeof (struct p2p_header);
+
+    packet_hexdump (data, len);
+    
+    switch (hdr->type)
+    {
+        case P2P_PACKET_TYPE_REGISTRATION:
+        {
+            char ip[IPSTR_LEN];
+
+            struct p2p_registration_packet *reg = (struct p2p_registration_packet *) payload;
+
+            assert (hdr->len == sizeof (struct p2p_registration_packet));
+
+            debug ("reg packet received\n");
+            debug ("  is_server : %d\n", reg->is_server);
+            debug ("  private   : %s\n", enet_addr_to_str (&reg->private, ip, sizeof (ip)));
+            debug ("  name      : %s\n", reg->name);
+
+            // TODO(17-dec-2021):
+            // 1. register peer
+            struct client *client = get_client_by_id (id);
+            client->state = REGISTERED;
+            client->is_server = reg->is_server;
+            client->max_players = 32;
+            client->priv.host = reg->private.host;
+            client->priv.port = reg->private.port;
+            snprintf (client->name, sizeof (client->name), "%s", reg->name);
+
+            // 2. send ack
+#define REG_ACK_LEN sizeof (struct p2p_header) + sizeof (struct p2p_registration_ack)
+            u8 buf[REG_ACK_LEN] = {};
+
+            struct p2p_header *hdr = (struct p2p_header *) buf;
+            hdr->magic = P2P_MAGIC;
+            hdr->type = P2P_PACKET_TYPE_REGISTRATION_ACK;
+
+            struct p2p_registration_ack *reg_ack = (struct p2p_registration_ack *) (buf + sizeof (struct p2p_header));
+            snprintf (reg_ack->msg, sizeof (reg_ack->msg), "%u is now registered in %s mode", id, (client->is_server ? "server" : "client"));
+
+            hdr->len = REG_ACK_LEN;
+
+            ENetPacket *ack_pkt = enet_packet_create ((void *) &buf,
+                                                      REG_ACK_LEN,
+                                                      ENET_PACKET_FLAG_RELIABLE);
+            enet_peer_send (client->peer, 0, ack_pkt);
+        } break;
+    }
 }
 
 int
 main (int argc, char *argv[])
 {
-  if (argc != 2)
-    {
-      usage ();
-      return -1;
-    }
+    float dt = 1000.0f / 60.0f;
+    int port;
 
-  int port = atoi (argv[1]);
-  float dt = 1000.0f / 60.0f;
-
-  if (signal (SIGINT, signal_handler) != SIG_ERR
-      && signal (SIGUSR1, signal_handler) != SIG_ERR
-      && enet_initialize () == 0)
+    if (parse_input (argc, argv, &port) &&
+        sig_init () &&
+        enet_initialize () == 0)
     {
-      ENetHost *server = setup (port);
+      ENetHost *server = setup (port, MAX_CLIENTS);
       if (server)
         {
-          //			dump_enet_peers (server);
-
           g__running = true;
           log ("Starting NAT punch-through server [%d]\n", port);
 
           while (g__running)
             {
-              match_clients (dt);
+              if (g__dump_enet_peer_state)
+              {
+                dump_enet_peers (server);
+                g__dump_enet_peer_state = false;
+              }
+
+              match_clients_v2 (dt);
 
               enet_host_service (server, 0, 0);
 
@@ -420,52 +676,33 @@ main (int argc, char *argv[])
                     {
                     case ENET_EVENT_TYPE_CONNECT:
                       {
-                        log ("client [%u] connected from [%s]\n", id, addr);
+                        log ("client [%u-%s] connected\n", id, addr);
 
                         struct client *new = get_free_client_slot ();
+                        assert (new);
+
                         new->id = id;
                         new->peer = event.peer;
                         new->state = UNINITIALISED;
                         new->pub.host = event.peer->address.host;
                         new->pub.port = event.peer->address.port;
 
-                        //                			event.peer->data =
-                        //                ptr_from_u32 (id);
-                        debug ("enet peer %p state: %d\n", event.peer,
-                               event.peer->state);
+                        debug ("enet peer %p state: %d (%s)\n", event.peer,
+                               event.peer->state, enet_state_str (event.peer->state));
                         debug ("enet peers: %d\n", server->connectedPeers);
+                        debug ("p2p-client_count: %d\n", client_count);
                       }
                       break;
                     case ENET_EVENT_TYPE_RECEIVE:
                       {
-                        // dump_enet_peers (server);
+                        log ("packet from [%u-%s]\n", id, addr);
 
-                        u32 id = generate_id (event.peer);
-                        debug ("packet from [%u]\n", id);
-
-                        ENetAddress *priv = (ENetAddress *)event.packet->data;
-                        char ip[32];
-
-                        enet_addr_to_str (priv, ip, sizeof (ip));
-
-                        debug ("priv: %s\n", ip);
-
-                        struct client *client = get_client_by_id (id);
-                        assert (client);
-
-                        if (client->state == UNINITIALISED)
-                          {
-                            client->priv.host = priv->host;
-                            client->priv.port = priv->port;
-                            client->state = LOOKING_FOR_PEER;
-                          }
+                        process_packet (id, (u8 *) event.packet->data, event.packet->dataLength);
                       }
                       break;
                     case ENET_EVENT_TYPE_DISCONNECT:
                       {
-                        u32 id = generate_id (event.peer);
-
-                        debug ("client [%u] disconnected\n", id);
+                        log ("client [%u-%s] disconnected\n", id, addr);
 
                         struct client *client = get_client_by_id (id);
 
@@ -498,3 +735,4 @@ main (int argc, char *argv[])
 
   return 0;
 }
+
