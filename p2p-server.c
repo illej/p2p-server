@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#if 0 // linux
-#include <unistd.h>
+#ifdef _WIN32
+  #include <io.h> // _access()
 #endif
 
 #include <p2p.h>
@@ -469,13 +469,36 @@ sig_init (void)
 #endif
 }
 
-static BOOL
-file_exists (LPCTSTR szPath)
+static bool
+check_network_test_file (void)
 {
-  DWORD dwAttrib = GetFileAttributes (szPath);
+    char *file = ".network_test.run";
+    bool running = false;
 
-  return (dwAttrib != INVALID_FILE_ATTRIBUTES &&
-         !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY));
+#ifdef _WIN32
+    if (_access (file, 0) != 0)
+#else
+    if (access (file, F_OK) != 0)
+#endif
+    {
+        running = true;
+    }
+    else
+    {
+        FILE *fp = fopen (file, "r");
+        if (fp)
+        {   
+            int val = -1;
+            int n = fscanf (fp, "%d", &val);
+            if (n == 1 && val > -1)
+            {
+                running = (val == 1);
+            }
+            fclose (fp);
+        }
+    }
+
+    return running;
 }
 
 static void
@@ -579,8 +602,10 @@ main (int argc, char *argv[])
           g__running = true;
           log ("Starting NAT punch-through server [%d]\n", port);
 
-          while (g__running && file_exists (".network_test.run"))
+          while (g__running)
             {
+              g__running = check_network_test_file ();
+
               if (g__dump_enet_peer_state)
               {
                 dump_enet_peers (server);
@@ -632,23 +657,27 @@ main (int argc, char *argv[])
                         log ("client [%u-%s] disconnected\n", id, addr);
 
                         struct client *client = get_client_by_id (id);
+                        log ("client: %p\n", client);
 
-                        client->id = 0;
-                        client->peer = NULL;
-                        client->private.host = 0;
-                        client->private.port = 0;
-                        client->public.host = 0;
-                        client->public.port = 0;
-                        client->state = P2P_PEER_STATE_UNINITIALISED;
-                        client_count--;
+                        if (client)
+                        {
+                            client->id = 0;
+                            client->peer = NULL;
+                            client->private.host = 0;
+                            client->private.port = 0;
+                            client->public.host = 0;
+                            client->public.port = 0;
+                            client->state = P2P_PEER_STATE_UNINITIALISED;
+                            client_count--;
+                        }
                       }
                       break;
                     }
                 }
-#if 0 // linux
-              usleep (dt * 1000);
-#else
+#if _WIN32
               Sleep ((DWORD) dt);
+#else
+              usleep (dt * 1000);
 #endif
             }
 
