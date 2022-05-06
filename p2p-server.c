@@ -129,7 +129,7 @@ setup (u16 port, int num_clients)
       2,          /* allow up to 2 channels to be used, 0 and 1 */
       0,          /* assume any amount of incoming bandwidth */
       0);         /* assume any amount of outgoing bandwidth */
-  assert (server);
+  ASSERT (server);
 
   return server;
 }
@@ -241,8 +241,8 @@ match_clients (float dt)
         {
           struct client *c = &clients[i];
 
-          char pu[P2P_IP_STR_LEN];
-          char pr[P2P_IP_STR_LEN];
+          char pu[P2P_IPSTRLEN];
+          char pr[P2P_IPSTRLEN];
 
           p2p_enet_addr_to_str (&c->public, pu, sizeof (pu));
           p2p_enet_addr_to_str (&c->private, pr, sizeof (pr));
@@ -270,13 +270,13 @@ match_clients (float dt)
           struct client *a = get_client_by_id (aid);
           struct client *b = get_client_by_id (bid);
 
-          assert (a && b);
+          ASSERT (a && b);
           debug ("matching %u clients\n", num_lfp);
           debug ("  a: %u\n", a->id);
           debug ("  b: %u\n", b->id);
 
           ENetPeer *peer_a = a->peer;
-          assert (peer_a);
+          ASSERT (peer_a);
 
           // pack b's data
           struct p2p_join_packet p = {0};
@@ -294,7 +294,7 @@ match_clients (float dt)
           debug ("sending %u\'s details to %u\n", b->id, a->id);
 
           ENetPeer *peer_b = b->peer;
-          assert (peer_b);
+          ASSERT (peer_b);
 
           // pack a's data
           p.id = a->id;
@@ -334,8 +334,8 @@ match_clients_v2 (float dt)
         {
           struct client *c = &clients[i];
 
-          char pu[P2P_IP_STR_LEN];
-          char pr[P2P_IP_STR_LEN];
+          char pu[P2P_IPSTRLEN];
+          char pr[P2P_IPSTRLEN];
 
           p2p_enet_addr_to_str (&c->public, pu, sizeof (pu));
           p2p_enet_addr_to_str (&c->private, pr, sizeof (pr));
@@ -388,11 +388,11 @@ match_clients_v2 (float dt)
                         log ("matching server(%s) and client(%s)\n", s->name, c->name);
                         ENetPeer *peer_c = c->peer;
                         ENetPeer *peer_s = s->peer;
-                        assert (peer_c);
-                        assert (peer_s);
+                        ASSERT (peer_c);
+                        ASSERT (peer_s);
 
-                        char pu[P2P_IP_STR_LEN];
-                        char pr[P2P_IP_STR_LEN];
+                        char pu[P2P_IPSTRLEN];
+                        char pr[P2P_IPSTRLEN];
 
                         p2p_enet_addr_to_str (&c->public, pu, sizeof (pu));
                         p2p_enet_addr_to_str (&c->private, pr, sizeof (pr));
@@ -524,19 +524,19 @@ packet_hexdump (u8 *data, size_t len)
 static void
 process_packet (u32 id, u8 *data, size_t len)
 {
-    assert (len >= sizeof (struct p2p_header));
+    ASSERT (len >= sizeof (struct p2p_header));
 
     struct p2p_header *hdr = (struct p2p_header *) data;
 
-    assert (hdr->magic == P2P_MAGIC);
-    assert (hdr->packet_type > P2P_PACKET_TYPE_MIN);
-    assert (hdr->packet_type < P2P_PACKET_TYPE_MAX);
-    assert (hdr->len > 0);
+    ASSERT (hdr->magic == P2P_MAGIC);
+    ASSERT (hdr->packet_type > P2P_PACKET_TYPE_MIN);
+    ASSERT (hdr->packet_type < P2P_PACKET_TYPE_MAX);
+    ASSERT (hdr->len > 0);
 
     u8 *payload = data + sizeof (struct p2p_header);
 
     struct client *cln = get_client_by_id (id);
-    assert (cln);
+    ASSERT (cln);
 
     packet_hexdump (data, len);
     
@@ -544,11 +544,11 @@ process_packet (u32 id, u8 *data, size_t len)
     {
         case P2P_PACKET_TYPE_REGISTRATION:
         {
-            char ip[P2P_IP_STR_LEN];
+            char ip[P2P_IPSTRLEN];
 
             struct p2p_registration_packet *reg = (struct p2p_registration_packet *) payload;
 
-            assert (hdr->len == sizeof (struct p2p_registration_packet));
+            ASSERT (hdr->len == sizeof (struct p2p_registration_packet));
 
             debug ("reg packet received\n");
             debug ("  mode      : %d\n", reg->mode);
@@ -620,7 +620,7 @@ main (int argc, char *argv[])
               while (enet_host_check_events (server, &event) > 0)
                 {
                   u32 id = p2p_get_peer_id (event.peer);
-                  char addr[P2P_IP_STR_LEN];
+                  char addr[P2P_IPSTRLEN];
 
                   p2p_enet_addr_to_str (&event.peer->address, addr, sizeof (addr));
 
@@ -631,7 +631,7 @@ main (int argc, char *argv[])
                         log ("client [%u-%s] connected\n", id, addr);
 
                         struct client *new = get_free_client_slot ();
-                        assert (new);
+                        ASSERT (new);
 
                         new->id = id;
                         new->peer = event.peer;
@@ -657,7 +657,7 @@ main (int argc, char *argv[])
                         log ("client [%u-%s] disconnected\n", id, addr);
 
                         struct client *client = get_client_by_id (id);
-                        log ("client: %p\n", client);
+                        log ("  client: %p\n", client);
 
                         if (client)
                         {

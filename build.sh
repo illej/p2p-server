@@ -35,4 +35,7 @@ fi
 echo "building server"
 gcc p2p-server.c -Wl,-rpath $EXT_PATH/lib -I include -o p2p-server -lenet
 
+echo "building client"
+gcc p2p-client.c -rdynamic -Wl,-rpath $EXT_PATH/lib -I include -o p2p-client -lenet
+
 echo "done"

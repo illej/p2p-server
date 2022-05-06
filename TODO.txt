@@ -1,0 +1,43 @@
+client				p2p-server			client
+hello server,
+connect me to anyone.
+I don't care how.
+let me send messages.
+I define 3 types:
+1 TEXT
+2 GAME_INPUT
+3 MAP
+
+_net.h
+enum message_type
+{
+	TEXT = 0,
+        GAME_INPUT,
+        MAP
+}
+
+struct message
+{
+	enum message_type type;
+}
+
+struct p2p p2p;
+u8 *data;
+size_t len;
+while (p2p_net_service (&p2p, data, len))
+{
+  switch (p2p.event.type)
+  {
+    case P2P_CONNECT: break;
+    case P2P_RECEIVE:
+	// process message
+        assert (len >= sizeof (struct message));
+        struct message *msg = (struct messge *) data;
+	switch (msg->type)
+        {
+            case TEXT:
+            case GAME_INPUT:
+            case MAP:
+        }
+    case P2P_DISCONNECT: break;
+}	
