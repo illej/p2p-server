@@ -19,7 +19,7 @@
 #define ASSERT(EXP)                                                           \
   if (!(EXP))                                                                 \
     {                                                                         \
-      printf ("%s:%d> assertion failed\n", __func__, __LINE__);      \
+      printf ("<Assertion Failed> %s() (%s:%d) \n", __func__, __FILE__, __LINE__);      \
       *(volatile int *) 0 = 0; \
     }
 #if _WIN32
@@ -35,6 +35,7 @@
 
 #define P2P_SERVER_IP "127.0.0.1"
 #define P2P_MAGIC 117
+#define P2P_VERSION 1
 #define P2P_IPSTRLEN (16 + 1 + 5) // 255.255.255.255:65535\n
 #define P2P_REG_PACKET_LEN (sizeof (struct p2p_header) + sizeof (struct p2p_registration_packet))
 
@@ -42,9 +43,16 @@ typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
 
+typedef void connect_f (u32 id, void *user_data);
+typedef void receive_f (u32 id, u8 *data, size_t len, void *user_data);
+typedef void disconnect_f (u32 id, void *user_data);
+
 typedef enum p2p_enum
 {
+    P2P_ENUM_INVALID = 0,
+
     P2P_OP_MODE_MIN = 1000,
+    P2P_OP_MODE_NONE,
     P2P_OP_MODE_CLIENT,
     P2P_OP_MODE_SERVER,
     P2P_OP_MODE_MATCH_MAKING_SERVER,
@@ -54,6 +62,9 @@ typedef enum p2p_enum
     P2P_JOIN_MODE_PASSIVE,
     P2P_JOIN_MODE_ACTIVE,
     P2P_JOIN_MODE_MAX,
+
+    P2P_REGISTER_STATE_IN_PROGRESS,
+    P2P_REGISTER_STATE_DONE,
 
     P2P_PEER_STATE_MIN = 3000,
     P2P_PEER_STATE_UNINITIALISED,
@@ -73,13 +84,36 @@ typedef enum p2p_enum
     P2P_EVENT_TYPE_DISCONNECT,
     P2P_EVENT_TYPE_MAX,
 
+    P2P_PACKET_DIRECTION_MIN = 000,
+    P2P_PACKET_DIRECTION_IN,
+    P2P_PACKET_DIRECTION_OUT,
+    P2P_PACKET_DIRECTION_MAX,
+
     P2P_PACKET_TYPE_MIN = 7000,
     P2P_PACKET_TYPE_REGISTRATION,
     P2P_PACKET_TYPE_REGISTRATION_ACK,
+    P2P_PACKET_TYPE_SERVER_LIST_REQUEST,
+    P2P_PACKET_TYPE_SERVER_LIST_SEND,
     P2P_PACKET_TYPE_JOIN,
     P2P_PACKET_TYPE_DATA, // user data
     P2P_PACKET_TYPE_MAX,
 } p2p_enum;
+
+/*
+ * TYPE - p2p_enum definition prefix
+ * VALUE - p2p_enum value
+ *
+ * For example:
+ *
+ *   P2P_ENUM_VALID(P2P_PACKET_TYPE, pkt->type);
+ *
+ * would expand to
+ *
+ *   (P2P_PACKET_TYPE_MIN < pkt->type && pkt->type < P2P_PACKET_TYPE_MAX);
+ */
+#define P2P_ENUM_VALID(TYPE, VALUE) (TYPE ## _MIN < (VALUE) && (VALUE) < TYPE ## _MAX)
+
+#define P2P_ENUM_CHECK(FLAGS, VALUE) (((FLAGS) & (VALUE)) == (VALUE))
 
 struct p2p_pending_connection
 {
@@ -88,6 +122,8 @@ struct p2p_pending_connection
     ENetAddress address;
 
     ENetPeer *enet_peer;
+
+    struct p2p_peer *parent;
 };
 
 struct p2p_peer
@@ -97,31 +133,37 @@ struct p2p_peer
     struct p2p_pending_connection pending_connections[8];
     u32 pending_count;
 
-    ENetPeer *wan;
-    ENetPeer *lan;
-    ENetPeer *dev;
-
-    ENetPeer *active_connection;
+    ENetPeer *active_connection; // TODO: enum indicating which one?
 };
 
 struct p2p
 {
     char name[32];
     p2p_enum mode;
+    p2p_enum state;
 
+    // Local host
     ENetHost *host;
 
-    u32 server_id;
+    // Match-making server
+    struct p2p_peer *mm_server;
 
     struct p2p_peer peers[32];
     u32 peer_count;
 
-    p2p_enum event;
+    connect_f *connect;
+    receive_f *receive;
+    disconnect_f *disconnect;
+
+    void *connect_data;
+    void *receive_data;
+    void *disconnect_data;
 };
 
 struct p2p_header
 {
     u32 magic;
+    u32 version;
     p2p_enum packet_type;
     size_t len;
 };
@@ -162,6 +204,7 @@ p2p_enum_str (p2p_enum val)
 {
     switch (val)
     {
+        case P2P_OP_MODE_NONE:                 return "P2P_OpMode_None";
         case P2P_OP_MODE_CLIENT:               return "P2P_OpMode_Client";
         case P2P_OP_MODE_SERVER:               return "P2P_OpMode_Server";
         case P2P_OP_MODE_MATCH_MAKING_SERVER:  return "P2P_OpMode_MatchMakingServer";
@@ -175,10 +218,14 @@ p2p_enum_str (p2p_enum val)
         case P2P_CONNECTION_STATE_IN_PROGRESS: return "P2P_ConnectionState_InProgress";
         case P2P_PACKET_TYPE_REGISTRATION:     return "P2P_PacketType_Registration";
         case P2P_PACKET_TYPE_REGISTRATION_ACK: return "P2P_PacketType_RegistrationAck";
+        case P2P_PACKET_TYPE_SERVER_LIST_REQUEST: return "P2P_PacketType_ServerListRequest";
+        case P2P_PACKET_TYPE_SERVER_LIST_SEND: return "P2P_PacketType_ServerListSend";
+        case P2P_PACKET_TYPE_JOIN:             return "P2P_PacketType_Join";
+        case P2P_PACKET_TYPE_DATA:             return "P2P_PacketType_Data";
         default:
         {
             fprintf (stderr, "Unknown P2P_Enum value: %d\n", val);
-            return "Unknown P2P_Enum value";
+            return "???";
         }
     }
 }
@@ -195,15 +242,27 @@ p2p_enet_addr_to_str (ENetAddress *addr, char *buf, size_t len)
 }
 
 void
-p2p_packet_dump (u8 *data, char *direction, ENetAddress *addr)
+p2p_packet_dump (u8 *data, p2p_enum direction, ENetAddress *addr)
 {
     char ipstr[P2P_IPSTRLEN];
 
-    printf ("Packet [%s] to [%s]:\n", direction, p2p_enet_addr_to_str (addr, ipstr, sizeof (ipstr)));
+    switch (direction)
+    {
+        case P2P_PACKET_DIRECTION_IN:
+        {
+            printf ("Packet [IN] from [%s]:\n", p2p_enet_addr_to_str (addr, ipstr, sizeof (ipstr)));
+        } break;
+        case P2P_PACKET_DIRECTION_OUT:
+        {
+            printf ("Packet [OUT] to [%s]:\n", p2p_enet_addr_to_str (addr, ipstr, sizeof (ipstr)));
+        } break;
+    }
 
     struct p2p_header *hdr = (struct p2p_header *) data;
+
     printf ("Header (%zu bytes)\n", sizeof (struct p2p_header));
     printf ("  Magic   : %u\n", hdr->magic);
+    printf ("  Version : %u\n", hdr->version);
     printf ("  Type    : %s (%u)\n", p2p_enum_str (hdr->packet_type), hdr->packet_type);
     printf ("  Length  : %zu\n", hdr->len);
 
@@ -211,20 +270,36 @@ p2p_packet_dump (u8 *data, char *direction, ENetAddress *addr)
     {
         case P2P_PACKET_TYPE_REGISTRATION:
         {
-           struct p2p_registration_packet *payload = (struct p2p_registration_packet *) (data + sizeof (struct p2p_header));
+            struct p2p_registration_packet *payload = (struct p2p_registration_packet *) (data + sizeof (struct p2p_header));
 
-           printf ("Payload (%zu bytes)\n", sizeof (struct p2p_registration_packet));
-           printf ("  Name    : %s\n", payload->name);
-           printf ("  Mode    : %s (%u)\n", p2p_enum_str (payload->mode), payload->mode);
-           printf ("  Private : %s\n", p2p_enet_addr_to_str (&payload->private, ipstr, sizeof (ipstr)));
+            printf ("Payload (%zu bytes)\n", sizeof (struct p2p_registration_packet));
+            printf ("  Name    : %s\n", payload->name);
+            printf ("  Mode    : %s (%u)\n", p2p_enum_str (payload->mode), payload->mode);
+            printf ("  Private : %s\n", p2p_enet_addr_to_str (&payload->private, ipstr, sizeof (ipstr)));
         } break;
         case P2P_PACKET_TYPE_REGISTRATION_ACK:
         {
             struct p2p_registration_ack *payload = (struct p2p_registration_ack *) (data + sizeof (struct p2p_header));
 
             printf ("Payload (%zu bytes)\n", sizeof (struct p2p_registration_ack));
-            printf ("  Msg    : %s\n", payload->msg);
+            printf ("  Msg     : %s\n", payload->msg);
         } break;
+        case P2P_PACKET_TYPE_JOIN:
+        {
+            struct p2p_join_packet *payload = (struct p2p_join_packet *) (data + sizeof (struct p2p_header));
+
+            printf ("Payload (%zu bytes)\n", sizeof (struct p2p_join_packet));
+            printf ("  ID      : %u\n", payload->id);
+            printf ("  Name    : %s\n", payload->name);
+            printf ("  Mode    : %s (%u)\n", p2p_enum_str (payload->join_mode), payload->join_mode);
+            printf ("  Public  : %s\n", p2p_enet_addr_to_str (&payload->public, ipstr, sizeof (ipstr)));
+            printf ("  Private : %s\n", p2p_enet_addr_to_str (&payload->private, ipstr, sizeof (ipstr)));
+        } break;
+        case P2P_PACKET_TYPE_DATA:
+        {
+            char *payload = (char *) (data + sizeof (struct p2p_header));
+            printf ("Payload : %s\n", payload);
+        }
     }
 }
 
@@ -274,28 +349,36 @@ hash_string (char *string, u32 hash)
 u32
 p2p_generate_id (ENetPeer *peer)
 {
+#if 0
   char addr[P2P_IPSTRLEN];
 
   return hash_string (p2p_enet_addr_to_str (&peer->address, addr, sizeof (addr)), 0);
-}
-
-u32
-p2p_generate_id_from_addr (ENetAddress *address)
-{
-  char addr[P2P_IPSTRLEN];
-
-  return hash_string (p2p_enet_addr_to_str (address, addr, sizeof (addr)), 0);
+#else
+  // TODO: ENDIANESS???
+    return peer->address.host ^ peer->address.port;
+#endif
 }
 
 u32
 p2p_get_peer_id (ENetPeer *peer)
 {
+
+#if 0
     if (!peer->data)
     {
         peer->data = ptr_from_u32 (p2p_generate_id (peer));
     }
 
     return u32_from_ptr (peer->data);
+#else
+    u32 id = 0;
+
+    if (peer)
+    {
+        id = p2p_generate_id (peer);
+    }
+  return id;
+#endif
 }
 
 ENetPeer *
@@ -321,6 +404,8 @@ p2p_get_enet_peer_by_id (ENetHost *host, u32 id)
 void
 DEBUG_peer_dump (struct p2p *p2p)
 {
+  char ipstr[P2P_IPSTRLEN] = {0};
+
     for (u32 i = 0; i < p2p->peer_count; i++)
     {
         struct p2p_peer *peer = &p2p->peers[i];
@@ -333,7 +418,6 @@ DEBUG_peer_dump (struct p2p *p2p)
         for (u32 j = 0; j < peer->pending_count; j++)
         {
             struct p2p_pending_connection *conn = &peer->pending_connections[j];
-            char ipstr[P2P_IPSTRLEN];
             printf ("  <conn: id=%u address=%s state=%s>\n",
                     conn->id, p2p_enet_addr_to_str (&conn->address, ipstr, sizeof (ipstr)), p2p_enum_str (conn->state));
         }
@@ -350,9 +434,11 @@ push_pending_connection (struct p2p_peer *peer, u32 ip, u16 port, p2p_enum join_
     {
         struct p2p_pending_connection *conn = &peer->pending_connections[i];
 
-        if (conn->id == (ip ^ port))
+        if (P2P_ENUM_VALID (P2P_CONNECTION_STATE, conn->state) &&
+            conn->id == (ip ^ port))
         {
             found = true;
+            printf ("[conn:PENDING] found existing connection (%u) for peer [%s]\n", conn->id, peer->name);
             break;
         }
     }
@@ -367,10 +453,13 @@ push_pending_connection (struct p2p_peer *peer, u32 ip, u16 port, p2p_enum join_
             conn->address.host = ip;
             conn->address.port = port;
             conn->state = P2P_CONNECTION_STATE_IDLE;
+            conn->parent = peer;
+
+            printf ("[conn:PENDING] pushed pending connection (%u) for [%s]\n", id, peer->name);
         }
         else
         {
-            fprintf (stderr, "Max connections reached for [%s]\n", peer->name);
+            fprintf (stderr, "[conn:PENDING] Max connections reached for [%s]\n", peer->name);
         }
     }
 
@@ -392,37 +481,53 @@ process_pending_connections (struct p2p *p2p)
             {
                 conn->enet_peer = enet_host_connect (p2p->host, &conn->address, 2, 0);
                 ASSERT (conn->enet_peer);
-                conn->enet_peer->data = peer;
+                conn->enet_peer->data = peer; // TODO: maybe remove this in favour of conn->parent
                 conn->state = P2P_CONNECTION_STATE_IN_PROGRESS;
+
+                printf ("[conn:PROCESS] initiating connection (%u) for peer [%s]\n", conn->id, peer->name);
             }
         }
     }
 }
 
 void
-complete_pending_connection (struct p2p *p2p, u32 id, u8 *data)
+complete_pending_connection (struct p2p *p2p, u32 id)
 {
+    u32 total_pending = 0;
+    u32 total_completed = 0;
+
     for (u32 i = 0; i < p2p->peer_count; i++)
     {
         struct p2p_peer *peer = &p2p->peers[i];
+        u32 pending = peer->pending_count;
+        u32 completed = 0;
 
-        for (u32 j = 0; j < peer->pending_count; j++)
+        for (u32 j = 0; j < pending; j++)
         {
             char ipstr[P2P_IPSTRLEN];
             struct p2p_pending_connection *conn = &peer->pending_connections[j];
 
             p2p_enet_addr_to_str (&conn->address, ipstr, sizeof (ipstr));
 
-            if (conn->id == id &&
-                conn->state == P2P_CONNECTION_STATE_IN_PROGRESS)
+            // TODO: this would be where we compare multiple connections for the same peer
+            // and chose one!
+            if (conn->id == id)
             {
+                ASSERT (conn->state == P2P_CONNECTION_STATE_IN_PROGRESS);
+
                 if (!peer->active_connection)
                 {
                     peer->active_connection = conn->enet_peer;
+                    printf ("[conn:COMPLETE] Peer [%s] setting active connection to [%s]\n",
+                            peer->name,
+                            p2p_enet_addr_to_str (&peer->active_connection->address, ipstr, sizeof (ipstr)));
+                    completed++;
                 }
                 else
                 {
-                    printf ("Peer [%s] has existing active connection to [%s]\n", peer->name, p2p_enet_addr_to_str (&peer->active_connection->address, ipstr, sizeof (ipstr)));
+                    printf ("[conn:COMPLETE] Peer [%s] has existing active connection to [%s]\n",
+                            peer->name,
+                            p2p_enet_addr_to_str (&peer->active_connection->address, ipstr, sizeof (ipstr)));
                 }
 
                 u32 last_index = peer->pending_count - 1;
@@ -439,28 +544,48 @@ complete_pending_connection (struct p2p *p2p, u32 id, u8 *data)
                 --peer->pending_count;
             }
         }
+
+        if (completed > 0)
+        {
+            printf ("[conn:COMPLETE] completed %u of %u connections for %s\n", completed, pending, peer->name);
+        }
+
+        total_completed += completed;
     }
 
 #if 1
+    printf ("[conn:COMPLETE] Completed %u of %u total pending connections\n", total_completed, total_pending);
     DEBUG_peer_dump (p2p);
 #endif
 }
 
-u32
+static void
+__get_mm_server_address (ENetAddress *address)
+{
+  // TODO: get from a config file maybe??
+  address->host = inet_addr ("127.0.0.1");
+  address->port = 1717;
+}
+
+struct p2p_peer *
 p2p_peer_create (struct p2p *p2p, char *name, char *ip, u16 port)
 {
-    u32 id = 0;
+    struct p2p_peer *p = NULL;
+    u32 host = inet_addr (ip);
 
     if (p2p->peer_count + 1 < ARRAY_LEN (p2p->peers))
     {
-        struct p2p_peer *p = &p2p->peers[p2p->peer_count++];
+        p = &p2p->peers[p2p->peer_count++];
         *p = P2P_PEER_ZERO;
 
-        snprintf (p->name, sizeof (p->name), "%s", name);
+        if (name)
+        {
+            snprintf (p->name, sizeof (p->name), "%s", name);
+        }
 
         if (ip && port > 0)
         {
-            id = push_pending_connection (p, inet_addr (ip), port, P2P_JOIN_MODE_ACTIVE);
+          push_pending_connection (p, inet_addr (ip), port, P2P_JOIN_MODE_ACTIVE);
         }
     }
     else
@@ -472,18 +597,7 @@ p2p_peer_create (struct p2p *p2p, char *name, char *ip, u16 port)
     DEBUG_peer_dump (p2p);
 #endif
 
-    return id;
-}
-
-void
-p2p_server_set (struct p2p *p2p, char *ip, u16 port)
-{
-    if (p2p->server_id > 0)
-    {
-        fprintf (stderr, "P2P Server already set %u\n",  p2p->server_id);
-    }
-
-    p2p->server_id = p2p_peer_create (p2p, "P2P-Server", ip, port);
+    return p;
 }
 
 u16
@@ -565,7 +679,10 @@ get_ip_from_interface (DWORD ifindex, char *ip, size_t ip_len)
         }
     }
 
-    if (adapter_info) free (adapter_info);
+    if (adapter_info)
+    {
+        free (adapter_info);
+    }
 
     if (!ok)
     {
@@ -664,6 +781,7 @@ send_registration_packet (struct p2p *p2p, u32 id)
 
     struct p2p_header *hdr = (struct p2p_header *) ptr;
     hdr->magic = P2P_MAGIC;
+    hdr->version = P2P_VERSION;
     hdr->packet_type = P2P_PACKET_TYPE_REGISTRATION;
     hdr->len = sizeof (struct p2p_registration_packet);
 
@@ -681,50 +799,143 @@ send_registration_packet (struct p2p *p2p, u32 id)
     enet_peer_send (dest, 0, packet);
 
 #if 1
-    p2p_packet_dump (buf, "Out", &dest->address);
+    p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &dest->address);
     p2p_packet_hexdump (buf, sizeof (buf));
 #endif
 }
 
-/**
- * @param p2p - main P2P state structure
- * @param id - connection ID
- * @param data - incoming packet data
- * @param datalen - length of incoming packet
- * @param buf - return buffer for application payload
- * @param buflen - length of return buffer
- */
 static void
-p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen, u8 *buf, size_t *buflen)
+request_server_list (struct p2p *p2p)
+{
+    ASSERT (p2p->mm_server);
+
+    u8 buf[sizeof (struct p2p_header)] = {0};
+
+    struct p2p_header *hdr = (struct p2p_header *) buf;
+    hdr->magic = P2P_MAGIC;
+    hdr->version = P2P_VERSION;
+    hdr->packet_type = P2P_PACKET_TYPE_SERVER_LIST_REQUEST;
+    hdr->len = sizeof (struct p2p_header);
+
+    ENetPacket *packet = enet_packet_create (buf, sizeof (buf), ENET_PACKET_FLAG_RELIABLE);
+    ENetPeer *dest = p2p->mm_server->active_connection;
+    enet_peer_send (dest, 0, packet);
+
+#if 1
+    p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &dest->address);
+    p2p_packet_hexdump (buf, sizeof (buf));
+#endif
+}
+
+static void
+send_server_list (struct p2p *p2p, u32 id)
+{
+    u8 buf[sizeof (struct p2p_header) + (8 * sizeof (u8))] = {0};
+
+    struct p2p_header *hdr = (struct p2p_header *) buf;
+    hdr->magic = P2P_MAGIC;
+    hdr->version = P2P_VERSION;
+    hdr->packet_type = P2P_PACKET_TYPE_SERVER_LIST_SEND;
+
+    u8 *ptr = (u8 *) (buf + sizeof (struct p2p_header));
+    u32 i = 0;
+    ptr[i++] = 1;
+    ptr[i++] = (u8) 'b';
+    ptr[i++] = (u8) 'o';
+    ptr[i++] = (u8) 'b';
+    ptr[i++] = (u8) '\0';
+    ptr[i++] = 7;
+    ptr[i++] = 16;
+    ptr[i++] = 117;
+
+    hdr->len = sizeof (struct p2p_header) + i;
+
+    ENetPacket *packet = enet_packet_create (buf, sizeof (buf), ENET_PACKET_FLAG_RELIABLE);
+    ENetPeer *dest = p2p->mm_server->active_connection;
+    enet_peer_send (dest, 0, packet);
+
+#if 1
+    p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &dest->address);
+    p2p_packet_hexdump (buf, sizeof (buf));
+#endif
+}
+
+static void
+send_data_packet (struct p2p *p2p, u32 id)
+{
+    char *data = "hello!";
+    u8 buf[sizeof (struct p2p_header) + 7] = {0};
+
+    struct p2p_header *hdr = (struct p2p_header *) buf;
+    hdr->magic = P2P_MAGIC;
+    hdr->version = P2P_VERSION;
+    hdr->packet_type = P2P_PACKET_TYPE_DATA;
+
+    u8 *ptr = (buf + sizeof (struct p2p_header));
+    memcpy (ptr, data, 7);
+
+    hdr->len = 7;
+
+    ENetPacket *packet = enet_packet_create (buf, sizeof (buf), ENET_PACKET_FLAG_RELIABLE);
+    ENetPeer *peer = get_enet_peer_by_id (p2p, id);
+    enet_peer_send (peer, 0, packet);
+
+    p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &peer->address);
+    p2p_packet_hexdump (buf, sizeof (buf));
+}
+
+static void
+p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen)
 {
     ASSERT (datalen >= sizeof (struct p2p_header));
 
     struct p2p_header *hdr = (struct p2p_header *) data;
 
+    p2p_packet_dump (data, P2P_PACKET_DIRECTION_IN, &get_enet_peer_by_id (p2p, id)->address);
     ASSERT (hdr->magic == P2P_MAGIC);
+    ASSERT (hdr->version == P2P_VERSION);
     ASSERT (hdr->packet_type > P2P_PACKET_TYPE_MIN);
     ASSERT (hdr->packet_type < P2P_PACKET_TYPE_MAX);
     ASSERT (hdr->len > 0);
-    p2p_packet_dump (data, "In", &get_enet_peer_by_id (p2p, id)->address);
 
     switch (hdr->packet_type)
     {
         case P2P_PACKET_TYPE_REGISTRATION:
         {
+            ASSERT (P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_MATCH_MAKING_SERVER));
 
+            // p2p_peer_set (&p2p, );
+        } break;
+        case P2P_PACKET_TYPE_REGISTRATION_ACK:
+        {
+            ASSERT (P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_CLIENT));
+            ASSERT (id == p2p_get_peer_id (p2p->mm_server->active_connection));
+
+            request_server_list (p2p);
+        } break;
+        case P2P_PACKET_TYPE_SERVER_LIST_REQUEST:
+        {
+            ASSERT (P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_MATCH_MAKING_SERVER));
+
+            send_server_list (p2p, id);
         } break;
         case P2P_PACKET_TYPE_JOIN:
         {
-            p2p->event = P2P_EVENT_TYPE_CONNECT;
+            struct p2p_join_packet *join = (struct p2p_join_packet *) (data + sizeof (struct p2p_header));
+
+            struct p2p_peer *peer = p2p_peer_create (p2p, join->name, NULL, 0);
+
+            // push_pending_connection (peer, join->private.host, join->private.port, P2P_JOIN_MODE_ACTIVE);
+            // push_pending_connection (peer, join->public.host, join->public.port, P2P_JOIN_MODE_ACTIVE);
         } break;
         case P2P_PACKET_TYPE_DATA:
         {
-            p2p->event = P2P_EVENT_TYPE_RECEIVE;
             // TODO:
             // * set return buffer to the start of the packet data
             // * set the return buffer length to the length of the
             //   packet data
-            // buf = (u8 *) (data + sizeof (struct p2p_header));
+            u8 *ptr = (u8 *) (data + sizeof (struct p2p_header));
+            p2p->receive (id, ptr, 17, p2p->receive_data);
         } break;
     }
 }
@@ -732,7 +943,7 @@ p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen, u8 *buf, 
 // TODO: do we need to deal with multiple events/packets?
 // this may have to be an even thinner wrapper around enet_host_service()!
 void
-p2p_service (struct p2p *p2p, u8 *buf, size_t *buflen)
+p2p_service (struct p2p *p2p)
 {
     process_pending_connections (p2p);
 
@@ -742,7 +953,7 @@ p2p_service (struct p2p *p2p, u8 *buf, size_t *buflen)
     while (enet_host_check_events (p2p->host, &event) > 0)
     {
         char ipstr[P2P_IPSTRLEN];
-        u32 id = (event.peer->address.host ^ event.peer->address.port);
+        u32 id = p2p_generate_id (event.peer);
 
         p2p_enet_addr_to_str (&event.peer->address, ipstr, sizeof (ipstr));
 
@@ -750,48 +961,88 @@ p2p_service (struct p2p *p2p, u8 *buf, size_t *buflen)
         {
             case ENET_EVENT_TYPE_CONNECT:
             {
+                /*
+                 * - someone has connected
+                 * - we have an address and maybe a generated number
+                 * - we know the address/port of the MM server, so we can see if it's them
+                 */
                 printf ("[service:CONNECT] from %s (%u)\n", ipstr, id);
-                complete_pending_connection (p2p, id, event.peer->data);
 
-                // TODO: how do we want to figure out which ENet Peer
-                // to send to?? Do we rely on the id, or store the
-                // pointer in ->data and use that??
-                if (id == p2p->server_id)
+                complete_pending_connection (p2p, id);
+
+                if (!P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_MATCH_MAKING_SERVER) &&
+                    id == p2p_get_peer_id (p2p->mm_server->active_connection))
                 {
                     send_registration_packet (p2p, id);
                 }
+                else
+                {
+                    // > be mm_server
+                    // we've received a connect from a peer, but it has nothing but the address
+                    // and MAYBE some u32 data in event.data.
+                    // * we want to store the ip/port.. do we wait till we get the registration
+                    // packet to fill in the details? that kind of makes sense.
+                    // * maybe we store
+                    u8 *octets = (u8 *) &addr->host;
+                    snprintf (buf, len, "%u.%u.%u.%u:%u", octets[0], octets[1], octets[2],
+                    p2p_peer_create (p2p, NULL, char *ip, u16 port);
+                }
+
+                p2p->connect (id, p2p->connect_data);
             } break;
             case ENET_EVENT_TYPE_RECEIVE:
             {
                 printf ("[service:RECEIVE] from %s (%u)\n", ipstr, id);
 
-                p2p_process_packet (p2p, id, (u8 *) event.packet->data, event.packet->dataLength, buf, buflen);
+                p2p_process_packet (p2p, id, (u8 *) event.packet->data, event.packet->dataLength);
             } break;
             case ENET_EVENT_TYPE_DISCONNECT:
             {
                 printf ("[service:DISCONNECT] from %s (%u)\n", ipstr, id);
 
                 // TODO: think about reconnection functionality
+                p2p->disconnect (id, p2p->disconnect_data);
             } break;
         }
     }
 }
 
+void
+p2p_set_connect_callback (struct p2p *p2p, connect_f *connect, void *data)
+{
+    p2p->connect = connect;
+    p2p->connect_data = data;
+}
+
+void
+p2p_set_receive_callback (struct p2p *p2p, receive_f *receive, void *data)
+{
+    p2p->receive = receive;
+    p2p->receive_data = data;
+}
+
+void
+p2p_set_disconnect_callback (struct p2p *p2p, disconnect_f *disconnect, void *data)
+{
+    p2p->disconnect = disconnect;
+    p2p->disconnect_data = data;
+}
+
 bool
-p2p_setup (struct p2p *p2p, char *name, p2p_enum mode)
+p2p_setup (struct p2p *p2p, char *name, p2p_enum mode, u16 port)
 {
     ENetHost *host = NULL;
-    ENetAddress address = {
-        .host = ENET_HOST_ANY,
-        .port = 0
-    };
+    ENetAddress address;
     bool ok = false;
+
+    address.host = ENET_HOST_ANY;
+    address.port = port;
 
     if (!name)
     {
         fprintf (stderr, "Name not specified\n");
     }
-    else if (mode < P2P_OP_MODE_MIN || mode > P2P_OP_MODE_MAX)
+    else if (!P2P_ENUM_VALID (P2P_OP_MODE, mode))
     {
         fprintf (stderr, "Bad enum value %d\n", mode);
     }
@@ -809,9 +1060,21 @@ p2p_setup (struct p2p *p2p, char *name, p2p_enum mode)
         p2p->mode = mode;
         p2p->host = host;
 
-        printf ("Starting P2P-Client as [%s] (%s)\n", p2p->name, p2p_enum_str (p2p->mode));
+        if (P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_MATCH_MAKING_SERVER))
+        {
+            printf ("Starting [%s] port:%u (%s)\n", p2p->name, port, p2p_enum_str (p2p->mode));
 
-        ok = p2p_peer_create (p2p, "P2P-Server", "203.86.199.79", 1717) > 0;
+            ok = true;
+        }
+        else
+        {
+            printf ("Starting [%s] (%s)\n", p2p->name, p2p_enum_str (p2p->mode));
+
+            // TODO: get the mm_server ip/port from a config file?
+            p2p->mm_server = p2p_peer_create (p2p, "P2P-Server", "127.0.0.1", 1717);
+
+            ok = (p2p->mm_server != NULL);
+        }
     }
 
     ASSERT (ok);

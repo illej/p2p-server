@@ -5,12 +5,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#ifdef _WIN32
-  #include <io.h> // _access()
-#endif
 
 #include <p2p.h>
-
+#define DEBUG
 #ifdef DEBUG
   #define debug(fmt, ...) __debug (__func__, __LINE__, fmt, ##__VA_ARGS__)
 #else
@@ -26,20 +23,6 @@ typedef uint16_t u16;
 typedef uint8_t u8;
 
 
-static char *
-packet_type_str (int type)
-{
-  switch (type)
-  {
-    case P2P_PACKET_TYPE_REGISTRATION:
-      return "Registration Packet";
-    case P2P_PACKET_TYPE_REGISTRATION_ACK:
-      return "Registration Ack Packet";
-    default:
-      return "Unknown packet type";
-  }
-}
-
 // TODO: rename to peer
 struct client
 {
@@ -54,6 +37,8 @@ struct client
   bool is_server;
   u32 current_players;
   u32 max_players;
+
+  u32 current_map_hash;
 };
 
 
@@ -204,6 +189,56 @@ dump_enet_peers (ENetHost *host)
     }
 }
 
+// TODO: move all this debug stuff into a library (single-header?)
+// * assert
+// * log helpers
+// * backtrace
+// https://stackoverflow.com/questions/11040133/what-does-defining-win32-lean-and-mean-exclude-exactly
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment (lib, "dbghelp.lib")
+
+void
+stack_trace (void)
+{
+    struct sym_pack
+    {
+        SYMBOL_INFO sym;
+        char name[255];
+    } sym_pack;
+    void *stack[64] = {0};
+
+    SYMBOL_INFO *symbol = &sym_pack.sym;
+    symbol->MaxNameLen = 255;
+    symbol->SizeOfStruct = sizeof (SYMBOL_INFO);
+
+    IMAGEHLP_LINE64 line;
+    line.SizeOfStruct = sizeof (IMAGEHLP_LINE64);
+
+    HANDLE process = GetCurrentProcess ();
+    SymInitialize (process, NULL, true);
+    SymSetOptions (SYMOPT_LOAD_LINES);
+
+    unsigned short frame_count = CaptureStackBackTrace (0, 100, stack, NULL);
+
+    printf ("----------------------------------------\n");
+    printf ("Call Stack:\n");
+    printf ("----------------------------------------\n");
+    for (int i = 1; i < frame_count; i++)
+    {
+        DWORD dwDisplacement;
+
+        SymFromAddr (process, (DWORD64) (stack[i]), 0, symbol);
+        SymGetLineFromAddr (process, (DWORD64) (stack[i]), &dwDisplacement, &line);
+
+        printf ("0x%0llX %i: %s\t(%s:%d)\n",
+                symbol->Address, frame_count - i - 1,
+                symbol->Name, line.FileName, line.LineNumber);
+    }
+    printf ("----------------------------------------\n");
+}
+
 static void
 signal_handler (int signal)
 {
@@ -212,7 +247,13 @@ signal_handler (int signal)
     case SIGINT:
       g__running = false;
       break;
-#if 0 // linux
+#if _WIN32
+    case SIGSEGV:
+      printf ("SEGMENTATION FAULT\n");
+      stack_trace ();
+      g__running = false;
+      break;
+#else /* linux */
     case SIGUSR1:
       g__dump_client_state = true;
       break;
@@ -223,6 +264,7 @@ signal_handler (int signal)
     }
 }
 
+#if 0
 static void
 match_clients (float dt)
 {
@@ -317,6 +359,7 @@ match_clients (float dt)
 
   t += dt;
 }
+#endif
 
 static void
 match_clients_v2 (float dt)
@@ -398,35 +441,54 @@ match_clients_v2 (float dt)
                         p2p_enet_addr_to_str (&c->private, pr, sizeof (pr));
 
                         // send server details to client
-                        struct p2p_join_packet p = {0};
-                        p.id = s->id;
-                        snprintf (p.name, sizeof (p.name), "%s", s->name);
-                        p.join_mode = P2P_JOIN_MODE_ACTIVE;
-                        p.private.host = s->private.host;
-                        p.private.port = s->private.port;
-                        p.public.host = s->public.host;
-                        p.public.port = s->public.port;
+                        u8 buf[sizeof (struct p2p_header) + sizeof (struct p2p_join_packet)] = {0};
+
+                        struct p2p_header *hdr = (struct p2p_header *) buf;
+                        hdr->magic = P2P_MAGIC;
+                        hdr->version = P2P_VERSION;
+                        hdr->packet_type = P2P_PACKET_TYPE_JOIN;
+                        hdr->len = sizeof (struct p2p_join_packet);
+
+                        struct p2p_join_packet *j = (struct p2p_join_packet *) (buf + sizeof (struct p2p_header));
+                        j->id = s->id;
+                        snprintf (j->name, sizeof (j->name), "%s", s->name);
+                        j->join_mode = P2P_JOIN_MODE_ACTIVE;
+                        j->private.host = s->private.host;
+                        j->private.port = s->private.port;
+                        j->public.host = s->public.host;
+                        j->public.port = s->public.port;
+
                         ENetPacket *to_c
-                            = enet_packet_create ((void *)&p, sizeof (struct p2p_join_packet),
+                            = enet_packet_create (buf, sizeof (buf),
                                     ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send (peer_c, 0, to_c);
 
                         log ("  sending server(%s) details to client(%s)\n", s->name, c->name);
+                        p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &peer_c->address);
 
                         // send client's details to server
-                        p.id = c->id;
-                        memset (p.name, 0, sizeof (p.name));
-                        snprintf (p.name, sizeof (p.name), "%s", c->name);
-                        p.join_mode = P2P_JOIN_MODE_PASSIVE;
-                        p.private.host = c->private.host;
-                        p.private.port = c->private.port;
-                        p.public.host = c->public.host;
-                        p.public.port = c->public.port;
-                        ENetPacket *to_s = enet_packet_create ((void *) &p, sizeof (struct p2p_join_packet),
+                        memset (buf, 0, sizeof (buf));
+                        hdr = (struct p2p_header *) buf;
+                        hdr->magic = P2P_MAGIC;
+                        hdr->version = P2P_VERSION;
+                        hdr->packet_type = P2P_PACKET_TYPE_JOIN;
+                        hdr->len = sizeof (struct p2p_join_packet);
+
+                        j = (struct p2p_join_packet *) (buf + sizeof (struct p2p_header));
+                        j->id = c->id;
+                        snprintf (j->name, sizeof (j->name), "%s", c->name);
+                        j->join_mode = P2P_JOIN_MODE_PASSIVE;
+                        j->private.host = c->private.host;
+                        j->private.port = c->private.port;
+                        j->public.host = c->public.host;
+                        j->public.port = c->public.port;
+
+                        ENetPacket *to_s = enet_packet_create (buf, sizeof (buf),
                                 ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send (peer_s, 0, to_s);
 
                         log ("  sending client(%s) details to server(%s)\n", c->name, s->name);
+                        p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &peer_s->address);
 
                         s->current_players++;
                         c->state = P2P_PEER_STATE_FOUND_PEER;
@@ -460,12 +522,14 @@ parse_input (int argc, char *argv[], u16 *port)
 static bool
 sig_init (void)
 {
-#if 0 // linux
-    return (signal (SIGINT, signal_handler) != SIG_ERR &&
-            signal (SIGUSR1, signal_handler) != SIG_ERR &&
-            signal (SIGUSR2, signal_handler) != SIG_ERR);
-#else
-    return (signal (SIGINT, signal_handler) != SIG_ERR);
+#if _WIN32
+  return (signal (SIGINT, signal_handler) != SIG_ERR &&
+          signal (SIGSEGV, signal_handler) != SIG_ERR);
+
+#else /* linux */
+  return (signal (SIGINT, signal_handler) != SIG_ERR &&
+          signal (SIGUSR1, signal_handler) != SIG_ERR &&
+          signal (SIGUSR2, signal_handler) != SIG_ERR);
 #endif
 }
 
@@ -475,27 +539,21 @@ check_network_test_file (void)
     char *file = ".network_test.run";
     bool running = false;
 
-#ifdef _WIN32
-    if (_access (file, 0) != 0)
-#else
-    if (access (file, F_OK) != 0)
-#endif
+    FILE *fp = fopen (file, "r");
+    if (fp)
     {
-        running = true;
+      int val = -1;
+      int n = fscanf (fp, "%d", &val);
+      if (n == 1 && val > -1)
+      {
+        running = (val == 1);
+      }
+
+      fclose (fp);
     }
     else
     {
-        FILE *fp = fopen (file, "r");
-        if (fp)
-        {   
-            int val = -1;
-            int n = fscanf (fp, "%d", &val);
-            if (n == 1 && val > -1)
-            {
-                running = (val == 1);
-            }
-            fclose (fp);
-        }
+      running = true;
     }
 
     return running;
@@ -529,6 +587,7 @@ process_packet (u32 id, u8 *data, size_t len)
     struct p2p_header *hdr = (struct p2p_header *) data;
 
     ASSERT (hdr->magic == P2P_MAGIC);
+    ASSERT (hdr->version == P2P_VERSION);
     ASSERT (hdr->packet_type > P2P_PACKET_TYPE_MIN);
     ASSERT (hdr->packet_type < P2P_PACKET_TYPE_MAX);
     ASSERT (hdr->len > 0);
@@ -571,6 +630,7 @@ process_packet (u32 id, u8 *data, size_t len)
 
             struct p2p_header *send_hdr = (struct p2p_header *) buf;
             send_hdr->magic = P2P_MAGIC;
+            send_hdr->version = P2P_VERSION;
             send_hdr->packet_type = P2P_PACKET_TYPE_REGISTRATION_ACK;
 
             struct p2p_registration_ack *reg_ack = (struct p2p_registration_ack *) (buf + sizeof (struct p2p_header));
@@ -586,6 +646,86 @@ process_packet (u32 id, u8 *data, size_t len)
     }
 }
 
+static void
+__service (ENetHost *server)
+{
+    enet_host_service (server, 0, 0);
+
+    ENetEvent event;
+    while (enet_host_check_events (server, &event) > 0)
+    {
+        u32 id = p2p_get_peer_id (event.peer);
+        char addr[P2P_IPSTRLEN];
+
+        p2p_enet_addr_to_str (&event.peer->address, addr, sizeof (addr));
+
+        switch (event.type)
+        {
+            case ENET_EVENT_TYPE_CONNECT:
+            {
+                log ("client [%u-%s] connected\n", id, addr);
+
+                struct client *new = get_free_client_slot ();
+                ASSERT (new);
+
+                new->id = id;
+                new->peer = event.peer;
+                new->state = P2P_PEER_STATE_UNINITIALISED;
+                new->public.host = event.peer->address.host;
+                new->public.port = event.peer->address.port;
+
+                debug ("enet peer %p state: %d (%s)\n", event.peer,
+                       event.peer->state, enet_state_str (event.peer->state));
+                debug ("enet peers: %zu\n", server->connectedPeers);
+                debug ("p2p-client_count: %d\n", client_count);
+            } break;
+            case ENET_EVENT_TYPE_RECEIVE:
+            {
+                        // log ("packet from [%u-%s]\n", id, addr);
+
+                process_packet (id, (u8 *) event.packet->data, event.packet->dataLength);
+            } break;
+            case ENET_EVENT_TYPE_DISCONNECT:
+            {
+                log ("client [%u-%s] disconnected\n", id, addr);
+
+                struct client *client = get_client_by_id (id);
+                log ("  client: %p\n", client);
+
+                if (client)
+                {
+                    client->id = 0;
+                    client->peer = NULL;
+                    client->private.host = 0;
+                    client->private.port = 0;
+                    client->public.host = 0;
+                    client->public.port = 0;
+                    client->state = P2P_PEER_STATE_UNINITIALISED;
+                    client_count--;
+                }
+            } break;
+        }
+    }
+}
+
+static void
+connect_cb (u32 id, void *data)
+{
+    printf ("connect_cb() id=%u\n", id);
+}
+
+static void
+receive_cb (u32 id, u8 *data, size_t len, void *user_data)
+{
+    printf ("receive_cb() id=%u data=%p len=%zu\n", id, data, len);
+}
+
+static void
+disconnect_cb (u32 id, void *data)
+{
+    printf ("disconnect_cb() id=%u\n", id);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -594,104 +734,57 @@ main (int argc, char *argv[])
 
     if (parse_input (argc, argv, &port) &&
         sig_init () &&
+#if 0
         enet_initialize () == 0)
-    {
-      ENetHost *server = setup (port, MAX_CLIENTS);
-      if (server)
-        {
-          g__running = true;
-          log ("Starting NAT punch-through server [%d]\n", port);
-
-          while (g__running)
-            {
-              g__running = check_network_test_file ();
-
-              if (g__dump_enet_peer_state)
-              {
-                dump_enet_peers (server);
-                g__dump_enet_peer_state = false;
-              }
-
-              match_clients_v2 (dt);
-
-              enet_host_service (server, 0, 0);
-
-              ENetEvent event;
-              while (enet_host_check_events (server, &event) > 0)
-                {
-                  u32 id = p2p_get_peer_id (event.peer);
-                  char addr[P2P_IPSTRLEN];
-
-                  p2p_enet_addr_to_str (&event.peer->address, addr, sizeof (addr));
-
-                  switch (event.type)
-                    {
-                    case ENET_EVENT_TYPE_CONNECT:
-                      {
-                        log ("client [%u-%s] connected\n", id, addr);
-
-                        struct client *new = get_free_client_slot ();
-                        ASSERT (new);
-
-                        new->id = id;
-                        new->peer = event.peer;
-                        new->state = P2P_PEER_STATE_UNINITIALISED;
-                        new->public.host = event.peer->address.host;
-                        new->public.port = event.peer->address.port;
-
-                        debug ("enet peer %p state: %d (%s)\n", event.peer,
-                               event.peer->state, enet_state_str (event.peer->state));
-                        debug ("enet peers: %zu\n", server->connectedPeers);
-                        debug ("p2p-client_count: %d\n", client_count);
-                      }
-                      break;
-                    case ENET_EVENT_TYPE_RECEIVE:
-                      {
-                        // log ("packet from [%u-%s]\n", id, addr);
-
-                        process_packet (id, (u8 *) event.packet->data, event.packet->dataLength);
-                      }
-                      break;
-                    case ENET_EVENT_TYPE_DISCONNECT:
-                      {
-                        log ("client [%u-%s] disconnected\n", id, addr);
-
-                        struct client *client = get_client_by_id (id);
-                        log ("  client: %p\n", client);
-
-                        if (client)
-                        {
-                            client->id = 0;
-                            client->peer = NULL;
-                            client->private.host = 0;
-                            client->private.port = 0;
-                            client->public.host = 0;
-                            client->public.port = 0;
-                            client->state = P2P_PEER_STATE_UNINITIALISED;
-                            client_count--;
-                        }
-                      }
-                      break;
-                    }
-                }
-#if _WIN32
-              Sleep ((DWORD) dt);
 #else
-              usleep (dt * 1000);
+        1)
 #endif
-            }
+    {
+#if 0
+      ENetHost *server = setup (port, MAX_CLIENTS);
+#else
+        struct p2p p2p = {0};
+        p2p_setup (&p2p, "NAT punch-through server", P2P_OP_MODE_MATCH_MAKING_SERVER, port);
+        p2p_set_connect_callback (&p2p, connect_cb, NULL);
+        p2p_set_receive_callback (&p2p, receive_cb, NULL);
+        p2p_set_disconnect_callback (&p2p, disconnect_cb, NULL);
+#endif
 
-          log ("exiting\n");
-          enet_host_destroy (server);
+      g__running = true;
+      while (g__running)
+      {
+          g__running = check_network_test_file ();
+
+#if 0
+          if (g__dump_enet_peer_state)
+          {
+            dump_enet_peers (server);
+            g__dump_enet_peer_state = false;
         }
-      else
-        {
-          debug ("An error occurred while trying to create an ENet server "
-                 "host.\n");
-        }
+
+        match_clients_v2 (dt);
+
+        __service (server);
+#else
+          p2p_service (&p2p);
+#endif
+
+#if _WIN32
+        Sleep ((DWORD) dt);
+#else
+        usleep (dt * 1000);
+#endif
     }
 
+    log ("exiting\n");
+#if 0
+    enet_host_destroy (server);
+#endif
+    }
+
+#if 0
   enet_deinitialize ();
+#endif
 
   return 0;
 }

@@ -1,8 +1,14 @@
 client				p2p-server			client
+
 hello server,
 connect me to anyone.
 I don't care how.
-let me send messages.
+
+* list of connected players
+  - some ID
+  - the entity they are controlling
+* let me send messages.
+
 I define 3 types:
 1 TEXT
 2 GAME_INPUT
@@ -41,3 +47,12 @@ while (p2p_net_service (&p2p, data, len))
         }
     case P2P_DISCONNECT: break;
 }	
+--- 17th Oct 2022 ---
+* as a game client, I want to be able to dynamically turn on/off server mode to
+let players join me
+- turn on server mode
+    - connect to MMServer
+    - register self as server
+    - accept incoming clients
+* as a game client, I want to join any available games being hosted
+* as a game client, I want to select a hosted game from a list and join it
