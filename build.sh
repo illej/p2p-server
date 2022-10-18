@@ -27,15 +27,16 @@ if [ ! -f $BUILD_FILE ]; then
     cd $ENET
     ./configure --prefix=$EXT_PATH && make && sudo make install
     cd ..
-    touch $BUILD_FILE
+
+    echo $ENET > $BUILD_FILE
 fi
 
 # LIB_PATH=/usr/local/lib
 
 echo "building server"
-gcc p2p-server.c -Wl,-rpath $EXT_PATH/lib -I include -o p2p-server -lenet
+gcc p2p-server.c -Wl,-rpath $EXT_PATH/lib -I $EXT_PATH/include -I ./include -o p2p-server -lenet
 
 echo "building client"
-gcc p2p-client.c -rdynamic -Wl,-rpath $EXT_PATH/lib -I include -o p2p-client -lenet
+gcc p2p-client.c -rdynamic -Wl,-rpath $EXT_PATH/lib -I $EXT_PATH/include -I ./include -o p2p-client -lenet
 
 echo "done"

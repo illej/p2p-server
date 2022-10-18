@@ -189,6 +189,7 @@ dump_enet_peers (ENetHost *host)
     }
 }
 
+#ifdef _WIN32
 // TODO: move all this debug stuff into a library (single-header?)
 // * assert
 // * log helpers
@@ -238,6 +239,7 @@ stack_trace (void)
     }
     printf ("----------------------------------------\n");
 }
+#endif /* _WIN32 */
 
 static void
 signal_handler (int signal)

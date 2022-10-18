@@ -482,6 +482,7 @@ send_hello (struct p2p *p2p, struct p2p_connection *conn)
     sin.sin_addr.s_addr = conn->address.host;
 
     int ret = sendto (p2p->host->socket, buf, len, 0, (struct sockaddr *) &sin, sizeof (sin));
+#if _WIN32
     if (ret == SOCKET_ERROR)
     {
         if (WSAGetLastError () == WSAEWOULDBLOCK)
@@ -493,6 +494,8 @@ send_hello (struct p2p *p2p, struct p2p_connection *conn)
             ret = -1; // error?
         }
     }
+    // TODO: linux else?
+#endif
 
     return ret;
 }
@@ -535,6 +538,7 @@ process_pending_connections (struct p2p *p2p)
                 }
                 else if (conn->state == P2P_CONNECTION_STATE_IN_PROGRESS)
                 {
+                    // TODO: don't send every frame - 
                     int ret = send_hello (p2p, conn);
 
                     printf ("[conn:PROCESS] sending hello to [%s] (ret=%d)\n", conn->parent->name, ret);
@@ -645,7 +649,6 @@ struct p2p_peer *
 p2p_peer_create (struct p2p *p2p, char *name, char *ip, u16 port)
 {
     struct p2p_peer *p = NULL;
-    u32 host = inet_addr (ip);
 
     if (p2p->peer_count + 1 < ARRAY_LEN (p2p->peers))
     {
@@ -988,11 +991,12 @@ p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen)
         {
             struct p2p_join_packet *join = (struct p2p_join_packet *) (data + sizeof (struct p2p_header));
 
+            // TODO: passing NULL here means we can manually push a connection below
+            // - maybe we doing something about that.. ?
             struct p2p_peer *peer = p2p_peer_create (p2p, join->name, NULL, 0);
 
             //push_pending_connection (peer, join->private.host, join->private.port, P2P_JOIN_MODE_ACTIVE);
             push_pending_connection (peer, join->public.host, join->public.port, join->join_mode);
-            // TODO: use sendto() directly on the p2p->host->socket to send UDP packets for NAT punch-through
 
         } break;
         case P2P_PACKET_TYPE_DATA:
