@@ -112,13 +112,14 @@ typedef enum p2p_enum
  *   (P2P_PACKET_TYPE_MIN < pkt->type && pkt->type < P2P_PACKET_TYPE_MAX);
  */
 #define P2P_ENUM_VALID(TYPE, VALUE) (TYPE ## _MIN < (VALUE) && (VALUE) < TYPE ## _MAX)
-
 #define P2P_ENUM_CHECK(FLAGS, VALUE) (((FLAGS) & (VALUE)) == (VALUE))
 
-struct p2p_pending_connection
+struct p2p_connection
 {
     u32 id;
+
     p2p_enum state;
+    p2p_enum mode;
     ENetAddress address;
 
     ENetPeer *enet_peer;
@@ -130,7 +131,7 @@ struct p2p_peer
 {
     char name[32];
 
-    struct p2p_pending_connection pending_connections[8];
+    struct p2p_connection pending_connections[8];
     u32 pending_count;
 
     ENetPeer *active_connection; // TODO: enum indicating which one?
@@ -198,6 +199,7 @@ struct p2p_join_ack
 };
 
 static const struct p2p_peer P2P_PEER_ZERO = {0};
+static const struct p2p_connection P2P_CONNECTION_ZERO = {0};
 
 char *
 p2p_enum_str (p2p_enum val)
@@ -410,14 +412,14 @@ DEBUG_peer_dump (struct p2p *p2p)
     {
         struct p2p_peer *peer = &p2p->peers[i];
 
-        printf ("<peer: name=%s pending_count=%u active(enet_id)=%u (%p)>\n",
+        printf ("<peer: name=%s pending_count=%u active(enet_id)=%u (0x%p)>\n",
                  peer->name, peer->pending_count,
-                 (peer->active_connection ? peer->active_connection->incomingPeerID : UINT32_MAX),
+                 (peer->active_connection ? peer->active_connection->incomingPeerID : 1337),
                  peer->active_connection);
 
         for (u32 j = 0; j < peer->pending_count; j++)
         {
-            struct p2p_pending_connection *conn = &peer->pending_connections[j];
+            struct p2p_connection *conn = &peer->pending_connections[j];
             printf ("  <conn: id=%u address=%s state=%s>\n",
                     conn->id, p2p_enet_addr_to_str (&conn->address, ipstr, sizeof (ipstr)), p2p_enum_str (conn->state));
         }
@@ -432,7 +434,7 @@ push_pending_connection (struct p2p_peer *peer, u32 ip, u16 port, p2p_enum join_
 
     for (u32 i = 0; i < peer->pending_count; i++)
     {
-        struct p2p_pending_connection *conn = &peer->pending_connections[i];
+        struct p2p_connection *conn = &peer->pending_connections[i];
 
         if (P2P_ENUM_VALID (P2P_CONNECTION_STATE, conn->state) &&
             conn->id == (ip ^ port))
@@ -447,12 +449,14 @@ push_pending_connection (struct p2p_peer *peer, u32 ip, u16 port, p2p_enum join_
     {
         if (peer->pending_count + 1 < ARRAY_LEN (peer->pending_connections))
         {
-            struct p2p_pending_connection *conn = &peer->pending_connections[peer->pending_count++];
+            struct p2p_connection *conn = &peer->pending_connections[peer->pending_count++];
+            *conn = P2P_CONNECTION_ZERO;
 
             id = conn->id = (ip ^ port);
             conn->address.host = ip;
             conn->address.port = port;
             conn->state = P2P_CONNECTION_STATE_IDLE;
+            conn->mode = join_mode;
             conn->parent = peer;
 
             printf ("[conn:PENDING] pushed pending connection (%u) for [%s]\n", id, peer->name);
@@ -466,36 +470,92 @@ push_pending_connection (struct p2p_peer *peer, u32 ip, u16 port, p2p_enum join_
     return id;
 }
 
+int
+send_hello (struct p2p *p2p, struct p2p_connection *conn)
+{
+    const char buf[] = "hello";
+    int len = sizeof (buf);
+    struct sockaddr_in sin = {0};
+
+    sin.sin_family = AF_INET;
+    sin.sin_port = ENET_HOST_TO_NET_16 (conn->address.port);
+    sin.sin_addr.s_addr = conn->address.host;
+
+    int ret = sendto (p2p->host->socket, buf, len, 0, (struct sockaddr *) &sin, sizeof (sin));
+    if (ret == SOCKET_ERROR)
+    {
+        if (WSAGetLastError () == WSAEWOULDBLOCK)
+        {
+            ret = 0; // retry?
+        }
+        else
+        {
+            ret = -1; // error?
+        }
+    }
+
+    return ret;
+}
+
+// TODO: need to step through this logic again to make sure it makes sense - same with complete_pending_connections()
 void
 process_pending_connections (struct p2p *p2p)
 {
+    u32 processed = 0;
+
     for (u32 i = 0; i < p2p->peer_count; i++)
     {
         struct p2p_peer *peer = &p2p->peers[i];
 
         for (u32 j = 0; j < peer->pending_count; j++)
         {
-            struct p2p_pending_connection *conn = &peer->pending_connections[j];
+            struct p2p_connection *conn = &peer->pending_connections[j];
 
-            if (conn->state == P2P_CONNECTION_STATE_IDLE)
+            if (conn->mode == P2P_JOIN_MODE_ACTIVE)
             {
-                conn->enet_peer = enet_host_connect (p2p->host, &conn->address, 2, 0);
-                ASSERT (conn->enet_peer);
-                conn->enet_peer->data = peer; // TODO: maybe remove this in favour of conn->parent
-                conn->state = P2P_CONNECTION_STATE_IN_PROGRESS;
+                if (conn->state == P2P_CONNECTION_STATE_IDLE)
+                {
+                    // TODO: can we eventually collapse the connection structure into just a ENetPeer?
+                    conn->enet_peer = enet_host_connect (p2p->host, &conn->address, 2, 0);
+                    ASSERT (conn->enet_peer);
+                    conn->parent = peer;
+                    conn->state = P2P_CONNECTION_STATE_IN_PROGRESS;
 
-                printf ("[conn:PROCESS] initiating connection (%u) for peer [%s]\n", conn->id, peer->name);
+                    printf ("[conn:PROCESS] initiating connection (%u) for peer [%s]\n", conn->id, peer->name);
+
+                    processed++;
+                }
+            }
+            else if (conn->mode == P2P_JOIN_MODE_PASSIVE)
+            {
+                if (conn->state == P2P_CONNECTION_STATE_IDLE)
+                {
+                    conn->parent = peer;
+                    conn->state = P2P_CONNECTION_STATE_IN_PROGRESS;
+                }
+                else if (conn->state == P2P_CONNECTION_STATE_IN_PROGRESS)
+                {
+                    int ret = send_hello (p2p, conn);
+
+                    printf ("[conn:PROCESS] sending hello to [%s] (ret=%d)\n", conn->parent->name, ret);
+                    ASSERT (ret > 0);
+                }
+                processed++;
             }
         }
     }
+
+#if 1
+    if (processed > 0)
+    {
+        DEBUG_peer_dump (p2p);
+    }
+#endif
 }
 
 void
-complete_pending_connection (struct p2p *p2p, u32 id)
+complete_pending_connection (struct p2p *p2p, u32 id, ENetPeer *enet_peer)
 {
-    u32 total_pending = 0;
-    u32 total_completed = 0;
-
     for (u32 i = 0; i < p2p->peer_count; i++)
     {
         struct p2p_peer *peer = &p2p->peers[i];
@@ -505,7 +565,7 @@ complete_pending_connection (struct p2p *p2p, u32 id)
         for (u32 j = 0; j < pending; j++)
         {
             char ipstr[P2P_IPSTRLEN];
-            struct p2p_pending_connection *conn = &peer->pending_connections[j];
+            struct p2p_connection *conn = &peer->pending_connections[j];
 
             p2p_enet_addr_to_str (&conn->address, ipstr, sizeof (ipstr));
 
@@ -515,33 +575,50 @@ complete_pending_connection (struct p2p *p2p, u32 id)
             {
                 ASSERT (conn->state == P2P_CONNECTION_STATE_IN_PROGRESS);
 
-                if (!peer->active_connection)
+                if (conn->mode == P2P_JOIN_MODE_ACTIVE)
                 {
-                    peer->active_connection = conn->enet_peer;
-                    printf ("[conn:COMPLETE] Peer [%s] setting active connection to [%s]\n",
-                            peer->name,
-                            p2p_enet_addr_to_str (&peer->active_connection->address, ipstr, sizeof (ipstr)));
+                    if (!peer->active_connection)
+                    {
+                        peer->active_connection = conn->enet_peer;
+                        printf ("[conn:COMPLETE] Peer [%s] setting active connection to [%s]\n",
+                                peer->name,
+                                p2p_enet_addr_to_str (&peer->active_connection->address, ipstr, sizeof (ipstr)));
+                        completed++;
+                    }
+                    else
+                    {
+                        // TODO: not sure if we need this branch anymore
+                        printf ("[conn:COMPLETE] Peer [%s] has existing active connection to [%s]\n",
+                                peer->name,
+                                p2p_enet_addr_to_str (&peer->active_connection->address, ipstr, sizeof (ipstr)));
+                    }
+                }
+                else if (conn->mode == P2P_JOIN_MODE_PASSIVE)
+                {
+                    ASSERT (!conn->enet_peer);
+                    conn->enet_peer = enet_peer;
+                    conn->parent->active_connection = enet_peer;
                     completed++;
                 }
-                else
-                {
-                    printf ("[conn:COMPLETE] Peer [%s] has existing active connection to [%s]\n",
-                            peer->name,
-                            p2p_enet_addr_to_str (&peer->active_connection->address, ipstr, sizeof (ipstr)));
-                }
 
-                u32 last_index = peer->pending_count - 1;
-                if (j != last_index)
+                if (completed > 0)
                 {
-                    struct p2p_pending_connection *last = &peer->pending_connections[last_index];
+                    u32 last_index = peer->pending_count - 1;
+                    if (j == last_index)
+                    {
+                        /* If this connection was the last in the list, zero it out */
+                        memset (conn, 0, sizeof (struct p2p_connection));
+                    }
+                    else
+                    {
+                        /* otherwise, copy the last one into this slot */
+                        struct p2p_connection *last = &peer->pending_connections[last_index];
 
-                    memcpy (conn, last, sizeof (struct p2p_pending_connection));
+                        memcpy (conn, last, sizeof (struct p2p_connection));
+                    }
+
+                    peer->pending_count--;
                 }
-                else
-                {
-                    memset (conn, 0, sizeof (struct p2p_pending_connection));
-                }
-                --peer->pending_count;
             }
         }
 
@@ -549,12 +626,9 @@ complete_pending_connection (struct p2p *p2p, u32 id)
         {
             printf ("[conn:COMPLETE] completed %u of %u connections for %s\n", completed, pending, peer->name);
         }
-
-        total_completed += completed;
     }
 
 #if 1
-    printf ("[conn:COMPLETE] Completed %u of %u total pending connections\n", total_completed, total_pending);
     DEBUG_peer_dump (p2p);
 #endif
 }
@@ -636,10 +710,6 @@ get_best_ifindex (char *dest_ip)
     {
         ret = ifindex;
     }
-    else
-    {
-        printf ("Failed to get ifindex\n");
-    }
 
     return ret;
 }
@@ -682,11 +752,6 @@ get_ip_from_interface (DWORD ifindex, char *ip, size_t ip_len)
     if (adapter_info)
     {
         free (adapter_info);
-    }
-
-    if (!ok)
-    {
-        printf ("Failed to get IP from ifindex %d\n", ifindex);
     }
 
     return ok;
@@ -741,7 +806,7 @@ get_local_private_ip (char *target_ip, char *ipstr, size_t len)
     }
 #endif /* _WIN32 */
 
-    printf ("Using [%s] as private IP\n", ipstr);
+    // printf ("Using [%s] as private IP\n", ipstr);
 
     return ok;
 }
@@ -925,8 +990,10 @@ p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen)
 
             struct p2p_peer *peer = p2p_peer_create (p2p, join->name, NULL, 0);
 
-            // push_pending_connection (peer, join->private.host, join->private.port, P2P_JOIN_MODE_ACTIVE);
-            // push_pending_connection (peer, join->public.host, join->public.port, P2P_JOIN_MODE_ACTIVE);
+            //push_pending_connection (peer, join->private.host, join->private.port, P2P_JOIN_MODE_ACTIVE);
+            push_pending_connection (peer, join->public.host, join->public.port, join->join_mode);
+            // TODO: use sendto() directly on the p2p->host->socket to send UDP packets for NAT punch-through
+
         } break;
         case P2P_PACKET_TYPE_DATA:
         {
@@ -942,6 +1009,8 @@ p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen)
 
 // TODO: do we need to deal with multiple events/packets?
 // this may have to be an even thinner wrapper around enet_host_service()!
+// TODO: rename this to p2p_peer_service or something, and only handle the client/peer interactions
+// - we will have a separate p2p_mmserver_service or something.
 void
 p2p_service (struct p2p *p2p)
 {
@@ -968,24 +1037,15 @@ p2p_service (struct p2p *p2p)
                  */
                 printf ("[service:CONNECT] from %s (%u)\n", ipstr, id);
 
-                complete_pending_connection (p2p, id);
+                complete_pending_connection (p2p, id, event.peer);
 
-                if (!P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_MATCH_MAKING_SERVER) &&
-                    id == p2p_get_peer_id (p2p->mm_server->active_connection))
+                ASSERT (p2p->mode != P2P_OP_MODE_MATCH_MAKING_SERVER);
+
+                // is this the MMServer connection completing
+                if (id == p2p_get_peer_id (p2p->mm_server->active_connection))
                 {
+                    // if so, we register
                     send_registration_packet (p2p, id);
-                }
-                else
-                {
-                    // > be mm_server
-                    // we've received a connect from a peer, but it has nothing but the address
-                    // and MAYBE some u32 data in event.data.
-                    // * we want to store the ip/port.. do we wait till we get the registration
-                    // packet to fill in the details? that kind of makes sense.
-                    // * maybe we store
-                    u8 *octets = (u8 *) &addr->host;
-                    snprintf (buf, len, "%u.%u.%u.%u:%u", octets[0], octets[1], octets[2],
-                    p2p_peer_create (p2p, NULL, char *ip, u16 port);
                 }
 
                 p2p->connect (id, p2p->connect_data);
@@ -1071,6 +1131,9 @@ p2p_setup (struct p2p *p2p, char *name, p2p_enum mode, u16 port)
             printf ("Starting [%s] (%s)\n", p2p->name, p2p_enum_str (p2p->mode));
 
             // TODO: get the mm_server ip/port from a config file?
+            // 17-oct-2022: also we want a function to turn
+            // server mode on/off, and have that controllable in-game,
+            // but for now we can use a file
             p2p->mm_server = p2p_peer_create (p2p, "P2P-Server", "127.0.0.1", 1717);
 
             ok = (p2p->mm_server != NULL);

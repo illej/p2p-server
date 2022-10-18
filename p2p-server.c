@@ -23,7 +23,7 @@ typedef uint16_t u16;
 typedef uint8_t u8;
 
 
-// TODO: rename to peer
+/* Match-Making Client */
 struct client
 {
   u32 id;
@@ -264,108 +264,9 @@ signal_handler (int signal)
     }
 }
 
-#if 0
 static void
-match_clients (float dt)
+DEBUG_dump_clients (void)
 {
-  static float t = 0;
-
-  if (t > 500)
-    {
-      t = 0;
-      u32 lfp[32] = {0};
-      u32 num_lfp = 0;
-
-      if (g__dump_client_state)
-        debug ("clients: %u\n", client_count);
-
-      for (u32 i = 0; i < client_count; i++)
-        {
-          struct client *c = &clients[i];
-
-          char pu[P2P_IPSTRLEN];
-          char pr[P2P_IPSTRLEN];
-
-          p2p_enet_addr_to_str (&c->public, pu, sizeof (pu));
-          p2p_enet_addr_to_str (&c->private, pr, sizeof (pr));
-
-          if (g__dump_client_state)
-            {
-              debug ("[%u] id=%u name=%s pub=%s priv=%s state=%s\n",
-                      i, c->id, c->name, pu, pr, peer_state_str (c));
-            }
-
-          if (c->state == P2P_PEER_STATE_LOOKING_FOR_PEER)
-            {
-              lfp[num_lfp++] = c->id;
-            }
-        }
-
-      if (g__dump_client_state)
-        g__dump_client_state = false;
-
-      if (num_lfp >= 2)
-        {
-          u32 aid = lfp[0];
-          u32 bid = lfp[1];
-
-          struct client *a = get_client_by_id (aid);
-          struct client *b = get_client_by_id (bid);
-
-          ASSERT (a && b);
-          debug ("matching %u clients\n", num_lfp);
-          debug ("  a: %u\n", a->id);
-          debug ("  b: %u\n", b->id);
-
-          ENetPeer *peer_a = a->peer;
-          ASSERT (peer_a);
-
-          // pack b's data
-          struct p2p_join_packet p = {0};
-          p.id = b->id;
-          p.join_mode = P2P_JOIN_MODE_ACTIVE;
-          p.private.host = b->private.host;
-          p.private.port = b->private.port;
-          p.public.host = b->public.host;
-          p.public.port = b->public.port;
-          ENetPacket *to_a
-              = enet_packet_create ((void *)&p, sizeof (struct p2p_join_packet),
-                                    ENET_PACKET_FLAG_RELIABLE);
-          enet_peer_send (peer_a, 0, to_a);
-
-          debug ("sending %u\'s details to %u\n", b->id, a->id);
-
-          ENetPeer *peer_b = b->peer;
-          ASSERT (peer_b);
-
-          // pack a's data
-          p.id = a->id;
-          p.join_mode = P2P_JOIN_MODE_PASSIVE;
-          p.private.host = a->private.host;
-          p.private.port = a->private.port;
-          p.public.host = a->public.host;
-          p.public.port = a->public.port;
-          ENetPacket *to_b
-              = enet_packet_create ((void *)&p, sizeof (struct p2p_join_packet),
-                                    ENET_PACKET_FLAG_RELIABLE);
-          enet_peer_send (peer_b, 0, to_b);
-
-          debug ("sending %u\'s details to %u\n", a->id, b->id);
-
-          a->state = P2P_PEER_STATE_FOUND_PEER;
-          b->state = P2P_PEER_STATE_FOUND_PEER;
-        }
-    }
-
-  t += dt;
-}
-#endif
-
-static void
-match_clients_v2 (float dt)
-{
-    static float t = 0;
-
     if (g__dump_client_state)
     {
       FILE *fp = fopen (".debug_dump", "w");
@@ -392,6 +293,12 @@ match_clients_v2 (float dt)
 
         g__dump_client_state = false;
     }
+}
+
+static void
+match_clients_v2 (float dt)
+{
+    static float t = 0;
 
     if (t >= 500.0f)
     {
@@ -428,7 +335,7 @@ match_clients_v2 (float dt)
 
                     if (!c->is_server && c->state == P2P_PEER_STATE_REGISTERED)
                     {
-                        log ("matching server(%s) and client(%s)\n", s->name, c->name);
+                        log ("[MMServer] matching server(%s) and client(%s)\n", s->name, c->name);
                         ENetPeer *peer_c = c->peer;
                         ENetPeer *peer_s = s->peer;
                         ASSERT (peer_c);
@@ -463,7 +370,7 @@ match_clients_v2 (float dt)
                                     ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send (peer_c, 0, to_c);
 
-                        log ("  sending server(%s) details to client(%s)\n", s->name, c->name);
+                        log ("[MMServer] sending server(%s) details to client(%s)\n", s->name, c->name);
                         p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &peer_c->address);
 
                         // send client's details to server
@@ -487,7 +394,7 @@ match_clients_v2 (float dt)
                                 ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send (peer_s, 0, to_s);
 
-                        log ("  sending client(%s) details to server(%s)\n", c->name, s->name);
+                        log ("[MMServer] sending client(%s) details to server(%s)\n", c->name, s->name);
                         p2p_packet_dump (buf, P2P_PACKET_DIRECTION_OUT, &peer_s->address);
 
                         s->current_players++;
@@ -646,6 +553,7 @@ process_packet (u32 id, u8 *data, size_t len)
     }
 }
 
+// TODO: move this into the library as p2p_matchmaking_server_service() or something
 static void
 __service (ENetHost *server)
 {
@@ -732,60 +640,32 @@ main (int argc, char *argv[])
     float dt = 1000.0f / 60.0f;
     u16 port;
 
-    if (parse_input (argc, argv, &port) &&
-        sig_init () &&
-#if 0
-        enet_initialize () == 0)
-#else
-        1)
-#endif
+    if (parse_input (argc, argv, &port) && sig_init ())
     {
-#if 0
-      ENetHost *server = setup (port, MAX_CLIENTS);
-#else
         struct p2p p2p = {0};
         p2p_setup (&p2p, "NAT punch-through server", P2P_OP_MODE_MATCH_MAKING_SERVER, port);
         p2p_set_connect_callback (&p2p, connect_cb, NULL);
         p2p_set_receive_callback (&p2p, receive_cb, NULL);
         p2p_set_disconnect_callback (&p2p, disconnect_cb, NULL);
-#endif
 
-      g__running = true;
-      while (g__running)
-      {
-          g__running = check_network_test_file ();
+        g__running = true;
+        while (g__running)
+        {
+            match_clients_v2 (dt);
 
-#if 0
-          if (g__dump_enet_peer_state)
-          {
-            dump_enet_peers (server);
-            g__dump_enet_peer_state = false;
-        }
-
-        match_clients_v2 (dt);
-
-        __service (server);
-#else
-          p2p_service (&p2p);
-#endif
+            __service (p2p.host);
 
 #if _WIN32
-        Sleep ((DWORD) dt);
+            Sleep ((DWORD) dt);
 #else
-        usleep (dt * 1000);
+            usleep (dt * 1000);
 #endif
+            if (g__running)
+            {
+                g__running = check_network_test_file ();
+            }
+        }
     }
 
-    log ("exiting\n");
-#if 0
-    enet_host_destroy (server);
-#endif
-    }
-
-#if 0
-  enet_deinitialize ();
-#endif
-
-  return 0;
+    return 0;
 }
-
