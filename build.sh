@@ -4,6 +4,7 @@ set -e
 
 ENET=enet-1.3.17
 ENET_TAR=$ENET.tar.gz
+EXT=$PWD/external
 BUILD_FILE=.build
 
 if [ ! -f $ENET_TAR ]; then
@@ -17,14 +18,14 @@ fi
 if [ ! -f $BUILD_FILE ]; then
     echo "building $ENET"
 
-    if [ ! -d external ]; then
-        mkdir -p external/{lib,include}
+    if [ ! -d $EXT ]; then
+        mkdir -p $EXT/{lib,include}
     fi
 
     tar -xzf $ENET_TAR
 
     cd $ENET
-    ./configure --prefix=$PWD/external && make && sudo make install
+    ./configure --prefix=$EXT && make && sudo make install
     cd ..
 
     echo $ENET > $BUILD_FILE
@@ -37,9 +38,9 @@ fi
 # -I        : compile-time include search path
 
 echo "building server"
-gcc p2p-server.c -Wl,-rpath external/lib -L external/lib -I external/include -I include -o p2p-server -lenet
+gcc p2p-server.c -Wl,-rpath $EXT/lib -L $EXT/lib -I $EXT/include -I include -o p2p-server -lenet
 
 echo "building client"
-gcc p2p-client.c -rdynamic -Wl,-rpath external/lib -L external/lib -I external/include -I include -o p2p-client -lenet
+gcc p2p-client.c -rdynamic -Wl,-rpath $EXT/lib -L $EXT/lib -I $EXT/include -I include -o p2p-client -lenet
 
 echo "done"
