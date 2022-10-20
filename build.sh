@@ -4,7 +4,6 @@ set -e
 
 ENET=enet-1.3.17
 ENET_TAR=$ENET.tar.gz
-EXT_PATH=$PWD/external
 BUILD_FILE=.build
 
 if [ ! -f $ENET_TAR ]; then
@@ -18,25 +17,29 @@ fi
 if [ ! -f $BUILD_FILE ]; then
     echo "building $ENET"
 
-    if [ ! -d $EXT_PATH ]; then
-        mkdir -p $EXT_PATH/{lib,include}
+    if [ ! -d external ]; then
+        mkdir -p external/{lib,include}
     fi
 
     tar -xzf $ENET_TAR
 
     cd $ENET
-    ./configure --prefix=$EXT_PATH && make && sudo make install
+    ./configure --prefix=$PWD/external && make && sudo make install
     cd ..
 
     echo $ENET > $BUILD_FILE
 fi
 
-# LIB_PATH=/usr/local/lib
+# -Wl       : send comma-separated options to linker
+# -rpath    : run-time library search path
+# -rdynamic : export symbols
+# -L        : compile-time library search path
+# -I        : compile-time include search path
 
 echo "building server"
-gcc p2p-server.c -Wl,-rpath $EXT_PATH/lib -I $EXT_PATH/include -I ./include -o p2p-server -lenet
+gcc p2p-server.c -Wl,-rpath external/lib -L external/lib -I external/include -I include -o p2p-server -lenet
 
 echo "building client"
-gcc p2p-client.c -rdynamic -Wl,-rpath $EXT_PATH/lib -I $EXT_PATH/include -I ./include -o p2p-client -lenet
+gcc p2p-client.c -rdynamic -Wl,-rpath external/lib -L external/lib -I external/include -I include -o p2p-client -lenet
 
 echo "done"
