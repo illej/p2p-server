@@ -114,6 +114,8 @@ typedef enum p2p_enum
 #define P2P_ENUM_VALID(TYPE, VALUE) (TYPE ## _MIN < (VALUE) && (VALUE) < TYPE ## _MAX)
 #define P2P_ENUM_CHECK(FLAGS, VALUE) (((FLAGS) & (VALUE)) == (VALUE))
 
+#define P2P_NAME_LEN 32 // TODO: probs a bit too large - maybe 16?
+
 struct p2p_connection
 {
     u32 id;
@@ -129,7 +131,7 @@ struct p2p_connection
 
 struct p2p_peer
 {
-    char name[32];
+    char name[P2P_NAME_LEN];
 
     struct p2p_connection pending_connections[8];
     u32 pending_count;
@@ -139,7 +141,7 @@ struct p2p_peer
 
 struct p2p
 {
-    char name[32];
+    char name[P2P_NAME_LEN];
     p2p_enum mode;
     p2p_enum state;
 
@@ -172,7 +174,7 @@ struct p2p_header
 struct p2p_registration_packet
 {
     p2p_enum mode;
-    char name[32];
+    char name[P2P_NAME_LEN];
     ENetAddress private; // u8 *private_ip;
 };
 
@@ -184,7 +186,7 @@ struct p2p_registration_ack
 struct p2p_join_packet
 {
     u32 id;
-    char name[32];
+    char name[P2P_NAME_LEN];
 
     p2p_enum join_mode;
 
@@ -1092,55 +1094,153 @@ p2p_set_disconnect_callback (struct p2p *p2p, disconnect_f *disconnect, void *da
     p2p->disconnect_data = data;
 }
 
-bool
-p2p_setup (struct p2p *p2p, char *name, p2p_enum mode, u16 port)
+void
+p2p_mode_set (struct p2p *p2p, p2p_enum mode, char *mm_server_ip, u16 mm_server_port)
 {
-    ENetHost *host = NULL;
-    ENetAddress address;
-    bool ok = false;
+    ENetAddress my_addr = {
+        .host = ENET_HOST_ANY,
+        .port = 0,
+    };
 
-    address.host = ENET_HOST_ANY;
-    address.port = port;
+    switch (mode)
+    {
+        case P2P_OP_MODE_MATCH_MAKING_SERVER:
+        {
+            my_addr.port = mm_server_port;
+        } break;
+        case P2P_OP_MODE_SERVER:
+        case P2P_OP_MODE_CLIENT:
+        {
+            p2p->mm_server = p2p_peer_create (p2p, "Match-Making Server", mm_server_ip, mm_server_port);
+        } break;
+    }
+}
+
+static bool
+p2p_params_valid (char *name, p2p_enum mode, char *ip)
+{
+    struct in_addr dummy = {0};
+    bool ok = false;
 
     if (!name)
     {
         fprintf (stderr, "Name not specified\n");
     }
+    else if (!(0 < strlen (name) && strlen (name) < P2P_NAME_LEN))
+    {
+        fprintf (stderr, "Invalid name length (max=%d)\n", P2P_NAME_LEN);
+    }
     else if (!P2P_ENUM_VALID (P2P_OP_MODE, mode))
     {
         fprintf (stderr, "Bad enum value %d\n", mode);
     }
-    else if (enet_initialize () != 0)
+    else if (ip && inet_pton (AF_INET, ip, &dummy) != 1)
     {
-        fprintf (stderr, "Failed to initialise ENet\n");
-    }
-    else if ((host = enet_host_create (&address, 32, 2, 0, 0)) == NULL)
-    {
-        fprintf (stderr, "Failed to create local ENet host\n");
+        fprintf (stderr, "Invalid IPv4 address\n");
     }
     else
     {
-        snprintf (p2p->name, sizeof (p2p->name), "%s", name);
-        p2p->mode = mode;
-        p2p->host = host;
+        ok = true;
+    }
 
-        if (P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_MATCH_MAKING_SERVER))
+    return ok;
+}
+
+static void
+read_server_config (u16 *port)
+{
+    FILE *fp = fopen ("p2p-server.conf", "r");
+    if (fp)
+    {
+        if (fscanf (fp, "%hu", port) == 1)
         {
-            printf ("Starting [%s] port:%u (%s)\n", p2p->name, port, p2p_enum_str (p2p->mode));
-
-            ok = true;
+            /* ok */
         }
         else
         {
-            printf ("Starting [%s] (%s)\n", p2p->name, p2p_enum_str (p2p->mode));
+            fprintf (stderr, "Failed to read p2p-server.conf\n");
+        }
 
-            // TODO: get the mm_server ip/port from a config file?
-            // 17-oct-2022: also we want a function to turn
-            // server mode on/off, and have that controllable in-game,
-            // but for now we can use a file
-            p2p->mm_server = p2p_peer_create (p2p, "P2P-Server", "127.0.0.1", 1717);
+        fclose (fp);
+    }
+}
 
-            ok = (p2p->mm_server != NULL);
+static void
+read_client_config (char *ip4, u16 *port)
+{
+    FILE *fp = fopen ("p2p-client.conf", "r");
+
+    if (fp)
+    {
+        if (fscanf (fp, "%s %hu", ip4, port) == 2)
+        {
+            /* ok */
+        }
+        else
+        {
+            fprintf (stderr, "Failed to read p2p-client.conf\n");
+        }
+
+        fclose (fp);
+    }
+}
+
+bool
+p2p_setup (struct p2p *p2p, char *name, p2p_enum mode)
+{
+    ENetHost *host = NULL;
+    ENetAddress addr = {
+        .host = ENET_HOST_ANY,
+        .port = 0,
+    };
+    bool ok = false;
+    char mm_server_ip[P2P_IPSTRLEN] = {0};
+    u16 mm_server_port = 0;
+
+    if (p2p->mode == P2P_OP_MODE_MATCH_MAKING_SERVER)
+    {
+        read_server_config (&mm_server_port);
+        addr.port = mm_server_port;
+    }
+    else
+    {
+        read_client_config (mm_server_ip, &mm_server_port);
+    }
+
+    if (p2p_params_valid (name, mode, mm_server_ip))
+    {
+        if (enet_initialize () == 0)
+        {
+            host = enet_host_create (&addr, 32, 2, 0, 0);
+            if (host)
+            {
+                snprintf (p2p->name, sizeof (p2p->name), "%s", name);
+                p2p->mode = mode;
+                p2p->host = host;
+
+                if (p2p->mode == P2P_OP_MODE_MATCH_MAKING_SERVER)
+                {
+                    printf ("Starting [%s] port:%u (%s)\n", p2p->name, mm_server_port, p2p_enum_str (p2p->mode));
+
+                    ok = true;
+                }
+                else
+                {
+                    printf ("Starting [%s] (%s)\n", p2p->name, p2p_enum_str (p2p->mode));
+
+                    p2p->mm_server = p2p_peer_create (p2p, "Match-Making Server", mm_server_ip, mm_server_port);
+
+                    ok = (p2p->mm_server != NULL);
+                }
+            }
+            else
+            {
+                fprintf (stderr, "Failed to create local ENet host\n");
+            }
+        }
+        else
+        {
+            fprintf (stderr, "Failed to initialise ENet\n");
         }
     }
 

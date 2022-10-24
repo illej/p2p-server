@@ -645,7 +645,15 @@ main (int argc, char *argv[])
     if (parse_input (argc, argv, &port) && sig_init ())
     {
         struct p2p p2p = {0};
-        p2p_setup (&p2p, "NAT punch-through server", P2P_OP_MODE_MATCH_MAKING_SERVER, port);
+
+        FILE *fp  = fopen ("p2p-server.conf", "w");
+        if (fp)
+        {
+            fprintf (fp, "%u", port);
+            fclose (fp);
+        }
+
+        p2p_setup (&p2p, "NAT punch-through server", P2P_OP_MODE_MATCH_MAKING_SERVER);
         p2p_set_connect_callback (&p2p, connect_cb, NULL);
         p2p_set_receive_callback (&p2p, receive_cb, NULL);
         p2p_set_disconnect_callback (&p2p, disconnect_cb, NULL);
