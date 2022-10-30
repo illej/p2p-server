@@ -178,7 +178,6 @@ main (int argc, char ** argv)
     }
     
     p2p_setup (&p2p, name, mode, 0);
-    // p2p_server_set (&p2p, "203.86.199.79", 1717);
     p2p_set_connect_callback (&p2p, connect_cb, NULL);
     p2p_set_receive_callback (&p2p, receive_cb, NULL);
     p2p_set_disconnect_callback (&p2p, disconnect_cb, NULL);

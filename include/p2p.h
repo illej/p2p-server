@@ -144,6 +144,7 @@ struct p2p
     char name[P2P_NAME_LEN];
     p2p_enum mode;
     p2p_enum state;
+    float dt;
 
     // Local host
     ENetHost *host;
@@ -151,8 +152,8 @@ struct p2p
     // Match-making server
     struct p2p_peer *mm_server;
 
-    struct p2p_peer peers[32];
     u32 peer_count;
+    struct p2p_peer peers[32];
 
     connect_f *connect;
     receive_f *receive;
@@ -246,6 +247,29 @@ p2p_enet_addr_to_str (ENetAddress *addr, char *buf, size_t len)
 }
 
 void
+p2p_packet_hexdump (u8 *data, size_t len)
+{
+    int cols = 0;
+
+    printf ("packet hexdump (%zu bytes)\n", len);
+    for (u32 i = 0; i < len; i++)
+    {
+        printf (" %02X", data[i]);
+        ++cols;
+        if (cols == 4)
+        {
+            printf (" ");
+        }
+        else if (cols == 8)
+        {
+            printf ("\n");
+            cols = 0;
+        }
+    }
+    printf ("\n");
+}
+
+void
 p2p_packet_dump (u8 *data, p2p_enum direction, ENetAddress *addr)
 {
     char ipstr[P2P_IPSTRLEN];
@@ -301,33 +325,10 @@ p2p_packet_dump (u8 *data, p2p_enum direction, ENetAddress *addr)
         } break;
         case P2P_PACKET_TYPE_DATA:
         {
-            char *payload = (char *) (data + sizeof (struct p2p_header));
-            printf ("Payload : %s\n", payload);
-        }
+            u8 *payload = (u8 *) (data + sizeof (struct p2p_header));
+	    p2p_packet_hexdump (payload, hdr->len);
+        } break;
     }
-}
-
-void
-p2p_packet_hexdump (u8 *data, size_t len)
-{
-    int cols = 0;
-
-    printf ("packet hexdump (%zu bytes)\n", len);
-    for (u32 i = 0; i < len; i++)
-    {
-        printf (" %02X", data[i]);
-        ++cols;
-        if (cols == 4)
-        {
-            printf (" ");
-        }
-        else if (cols == 8)
-        {
-            printf ("\n");
-            cols = 0;
-        }
-    }
-    printf ("\n");
 }
 
 u32
@@ -353,36 +354,8 @@ hash_string (char *string, u32 hash)
 u32
 p2p_generate_id (ENetPeer *peer)
 {
-#if 0
-  char addr[P2P_IPSTRLEN];
-
-  return hash_string (p2p_enet_addr_to_str (&peer->address, addr, sizeof (addr)), 0);
-#else
   // TODO: ENDIANESS???
     return peer->address.host ^ peer->address.port;
-#endif
-}
-
-u32
-p2p_get_peer_id (ENetPeer *peer)
-{
-
-#if 0
-    if (!peer->data)
-    {
-        peer->data = ptr_from_u32 (p2p_generate_id (peer));
-    }
-
-    return u32_from_ptr (peer->data);
-#else
-    u32 id = 0;
-
-    if (peer)
-    {
-        id = p2p_generate_id (peer);
-    }
-  return id;
-#endif
 }
 
 ENetPeer *
@@ -394,7 +367,7 @@ p2p_get_enet_peer_by_id (ENetHost *host, u32 id)
     {
       if (peer->state == ENET_PEER_STATE_CONNECTED)
         {
-          u32 peer_id = p2p_get_peer_id (peer);
+          u32 peer_id = p2p_generate_id (peer);
           if (peer_id == id)
             {
               return peer;
@@ -503,6 +476,8 @@ send_hello (struct p2p *p2p, struct p2p_connection *conn)
 }
 
 // TODO: need to step through this logic again to make sure it makes sense - same with complete_pending_connections()
+// TODO: this only works for public endpoints, and not within a LAN.
+//  - maybe try first over LAN (private endpoints), and after a timeout try WAN (public endpoints)
 void
 process_pending_connections (struct p2p *p2p)
 {
@@ -541,10 +516,17 @@ process_pending_connections (struct p2p *p2p)
                 else if (conn->state == P2P_CONNECTION_STATE_IN_PROGRESS)
                 {
                     // TODO: don't send every frame - 
-                    int ret = send_hello (p2p, conn);
+		    // once we have a timer working, also add a timeout
+		    static float t = 0.0f;
+		    t += p2p->dt;
+		    if (t >= 5000)
+		    {
+			    t = 0.0f;
+			    int ret = send_hello (p2p, conn);
 
-                    printf ("[conn:PROCESS] sending hello to [%s] (ret=%d)\n", conn->parent->name, ret);
-                    ASSERT (ret > 0);
+			    printf ("[conn:PROCESS] sending hello to [%s] (ret=%d)\n", conn->parent->name, ret);
+			    ASSERT (ret > 0);
+		    }
                 }
                 processed++;
             }
@@ -979,7 +961,7 @@ p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen)
         case P2P_PACKET_TYPE_REGISTRATION_ACK:
         {
             ASSERT (P2P_ENUM_CHECK (p2p->mode, P2P_OP_MODE_CLIENT));
-            ASSERT (id == p2p_get_peer_id (p2p->mm_server->active_connection));
+            ASSERT (id == p2p_generate_id (p2p->mm_server->active_connection));
 
             request_server_list (p2p);
         } break;
@@ -997,8 +979,9 @@ p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen)
             // - maybe we doing something about that.. ?
             struct p2p_peer *peer = p2p_peer_create (p2p, join->name, NULL, 0);
 
-            //push_pending_connection (peer, join->private.host, join->private.port, P2P_JOIN_MODE_ACTIVE);
-            push_pending_connection (peer, join->public.host, join->public.port, join->join_mode);
+	    // TODO: we want to try LAN first, then try WAN?
+            push_pending_connection (peer, join->private.host, join->private.port, join->join_mode);
+            // push_pending_connection (peer, join->public.host, join->public.port, join->join_mode);
 
         } break;
         case P2P_PACKET_TYPE_DATA:
@@ -1008,7 +991,7 @@ p2p_process_packet (struct p2p *p2p, u32 id, u8 *data, size_t datalen)
             // * set the return buffer length to the length of the
             //   packet data
             u8 *ptr = (u8 *) (data + sizeof (struct p2p_header));
-            p2p->receive (id, ptr, 17, p2p->receive_data);
+            p2p->receive (id, ptr, hdr->len, p2p->receive_data);
         } break;
     }
 }
@@ -1048,7 +1031,7 @@ p2p_service (struct p2p *p2p)
                 ASSERT (p2p->mode != P2P_OP_MODE_MATCH_MAKING_SERVER);
 
                 // is this the MMServer connection completing
-                if (id == p2p_get_peer_id (p2p->mm_server->active_connection))
+                if (id == p2p_generate_id (p2p->mm_server->active_connection))
                 {
                     // if so, we register
                     send_registration_packet (p2p, id);

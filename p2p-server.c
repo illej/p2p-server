@@ -564,7 +564,7 @@ __service (ENetHost *server)
     ENetEvent event;
     while (enet_host_check_events (server, &event) > 0)
     {
-        u32 id = p2p_get_peer_id (event.peer);
+        u32 id = p2p_generate_id (event.peer);
         char addr[P2P_IPSTRLEN];
 
         p2p_enet_addr_to_str (&event.peer->address, addr, sizeof (addr));
